@@ -39,7 +39,7 @@ OX = -CITY_SZ / 2.0
 OZ = -CITY_SZ / 2.0
 MASTER = "Procedural_City"
 
-# 6x6 placement grid per block with 18 buildings/block => 12*12*18 = 2592
+# 6x6 placement grid per block with 18 buildings/block => 2592 buildings total
 SUBDIV = 6
 CELL_SZ = BLOCK_SIZE / float(SUBDIV)
 BUILDINGS_PER_BLOCK = 18
@@ -365,7 +365,7 @@ def create_prototypes():
             assign("dark", ws)
             cparts.append(ws)
         car = combine(cparts, "proto_car_" + color)
-        register_prototype("car_" + color, car)
+        register_prototype(color, car)
 
 
 # -----------------------------------------------------------------------------
@@ -473,6 +473,8 @@ def build_ground_roads_sidewalks_markings():
 
 def add_building_windows(cx, base_y, cz, w, h, d, landmark=False):
     # Instanced thin windows (no full cubes)
+    # Non-landmarks use alternating back rows to preserve visual density while
+    # reducing far-side instance counts for performance.
     nx = 4 if landmark else 3
     ny = 5 if landmark else 3
     nx = max(2, min(nx, int(max(2.0, w) / 2.0)))
@@ -576,8 +578,9 @@ def build_buildings():
     mats = ["bb_beige", "bb_cream", "bb_gray", "bb_bronze", "bb_blue", "bb_terra", "bb_olive", "brick"]
 
     bldg_objs = []
-    total_blocks = N * N
     block_index = 0
+
+    effective_per_block = max(4, min(BUILDINGS_PER_BLOCK, SUBDIV * SUBDIV))
 
     for bi in range(N):
         for bj in range(N):
@@ -588,7 +591,8 @@ def build_buildings():
             corner_cells = [(0, 0), (0, SUBDIV - 1), (SUBDIV - 1, 0), (SUBDIV - 1, SUBDIV - 1)]
             interior = [p for p in cells if p not in corner_cells]
             random.shuffle(interior)
-            chosen = corner_cells + interior[:BUILDINGS_PER_BLOCK - len(corner_cells)]
+            regular_target = max(0, effective_per_block - len(corner_cells))
+            chosen = corner_cells + interior[:regular_target]
 
             prev_h = -999
             prev_m = None
@@ -614,7 +618,9 @@ def build_buildings():
                     style = random.choice(styles)
                     mat = random.choice(mats)
                     if mat == prev_m:
-                        mat = random.choice([m for m in mats if m != prev_m])
+                        alternatives = [m for m in mats if m != prev_m]
+                        if alternatives:
+                            mat = random.choice(alternatives)
                     base_h = 1.0
 
                 prev_h = h
@@ -636,7 +642,7 @@ def build_buildings():
                 periodic_cleanup("{} blocks".format(block_index))
 
     put(bldg_objs, "Grp_Buildings")
-    print("  Buildings generated: {}".format(N * N * BUILDINGS_PER_BLOCK))
+    print("  Buildings generated: {}".format(N * N * effective_per_block))
     print("  Entrance records: {}".format(len(_entrances)))
 
 
@@ -731,7 +737,7 @@ def place_street_furniture(sidewalk_h):
 
 def place_cars(sidewalk_h):
     n_cars = random.randint(150, 200)
-    car_assets = ["car_car_r", "car_car_b", "car_car_s", "car_car_k", "car_car_w"]
+    car_assets = ["car_r", "car_b", "car_s", "car_k", "car_w"]
     for _ in range(n_cars):
         lane = random.choice(["parked_v", "parked_h", "driving_v", "driving_h"])
         if lane == "parked_v":
@@ -884,7 +890,8 @@ def generate_city():
     print("  QUALITY: {}".format(QUALITY))
     print("  Grid: {}x{} | Buildings per block: {}".format(N, N, BUILDINGS_PER_BLOCK))
 
-    # Force clean scene and suspend viewport updates for performance
+    # Force clean scene and suspend viewport updates for performance.
+    # NOTE: This intentionally clears any unsaved scene content.
     cmds.file(newFile=True, force=True)
     cmds.refresh(suspend=True)
 
