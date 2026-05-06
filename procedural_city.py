@@ -96,7 +96,7 @@ def mkbox(nm, cx, by, cz, w, h, d, ry=0):
 
 def mkcyl(nm, cx, by, cz, r, h, ry=0, rx_=0, rz_=0):
     """Create a polyCylinder.  Bottom at y=by."""
-    o = cmds.polyCylinder(r=r, h=h, sc=0, sx=10, sy=1, name=uid(nm))[0]
+    o = cmds.polyCylinder(r=r, h=h, sc=0, sx=8, sy=1, name=uid(nm))[0]
     cmds.move(cx, by + h * 0.5, cz, o)
     if rx_:
         cmds.rotate(rx_, 0, 0, o, r=True)
@@ -109,7 +109,7 @@ def mkcyl(nm, cx, by, cz, r, h, ry=0, rx_=0, rz_=0):
 
 def mksph(nm, cx, cy, cz, r):
     """Create a polySphere centred at (cx, cy, cz)."""
-    o = cmds.polySphere(r=r, sx=10, sy=8, name=uid(nm))[0]
+    o = cmds.polySphere(r=r, sx=8, sy=6, name=uid(nm))[0]
     cmds.move(cx, cy, cz, o)
     return o
 
@@ -265,6 +265,21 @@ def put(objs, gname):
                 pass
 
 
+def collapse_meshes(objs, prefix):
+    """Merge related mesh pieces into one object to reduce scene object count."""
+    valid = [o for o in objs if o and cmds.objExists(o)]
+    if not valid:
+        return []
+    if len(valid) == 1:
+        return valid
+    try:
+        merged = cmds.polyUnite(valid, ch=False, mergeUVSets=True, name=uid(prefix))[0]
+        return [merged]
+    except RuntimeError:
+        # If Maya cannot merge a specific object set, keep the original pieces.
+        return valid
+
+
 # =============================================================================
 # SECTION 1: GROUND PLANE
 # =============================================================================
@@ -406,7 +421,7 @@ _entrances = []   # each entry: (cx, cz, front_z, bldg_w)
 
 
 # Window column density: 1 column per this many units of building width
-WIN_COL_DIVISOR = 4.0
+WIN_COL_DIVISOR = 5.0
 
 # -- Window grid helper --
 def add_windows(cx, base_y, cz, w, h, d, style):
@@ -414,11 +429,12 @@ def add_windows(cx, base_y, cz, w, h, d, style):
     objs  = []
     wmat  = "glass" if style in ("modern_glass", "futuristic") else "glassd"
     WW, WH, WD = 0.75, 1.00, 0.12    # width, height, extrusion depth
+    WINDOW_BASE_Y_OFFSET = 2.5
     WCX = max(1.8, w / WIN_COL_DIVISOR)   # column spacing
     WRY = 2.2                              # row spacing
-    nx  = max(1, min(5, int((w - 0.5) / WCX)))
-    nf  = max(1, min(5, int((h - 2.5) / WRY)))
-    start_y = base_y + 2.5
+    nx  = max(1, min(4, int((w - 0.5) / WCX)))
+    nf  = max(1, min(4, int((h - WINDOW_BASE_Y_OFFSET) / WRY)))
+    start_y = base_y + WINDOW_BASE_Y_OFFSET
     for row in range(nf):
         wy = start_y + row * WRY + WH * 0.5
         for col in range(nx):
@@ -576,7 +592,7 @@ def build_regular(cx, cz, w, d, h, style, bmat):
     # Rooftop details (AC / vent / dish)
     if random.random() < 0.65:
         objs.extend(add_roof_details(cx, h, cz, w, d))
-    return objs
+    return collapse_meshes(objs, "bldg")
 
 
 # -- Landmark corner building constructor --
@@ -610,7 +626,7 @@ def build_landmark(cx, cz, w, d, h):
         o = mkcyl("tcap", cx + dx, h * 0.85, cz + dz, 0.75, 0.4)
         asgn("concrete", o); objs.append(o)
     objs.extend(add_roof_details(cx, h, cz, w, d))
-    return objs
+    return collapse_meshes(objs, "lm_bldg")
 
 
 # -- Place buildings across all 20x20 blocks --
@@ -714,7 +730,7 @@ def make_traffic_light(px, pz, facing_x):
                                          ("lt_grn",  4.9)]):
         o = mkcyl("ltlight", hx, ly_off, hz, 0.12, 0.12)
         asgn(lmat, o); objs.append(o)
-    return objs
+    return collapse_meshes(objs, "tl_asset")
 
 
 for col in range(N + 1):
@@ -761,7 +777,7 @@ def make_billboard(cx, by, cz, ry=0):
     mat2 = random.choice(BILL_MATS)
     o = mkbox("bface", cx, leg_h, cz + bd * 0.5, bw, bh, bd * 0.5, ry=ry)
     asgn(mat2, o); objs.append(o)
-    return objs
+    return collapse_meshes(objs, "billboard")
 
 
 # Scatter 30 billboards along roads (sidewalk edge)
@@ -801,7 +817,7 @@ def make_tree(cx, cz):
         fmat = "foliage" if k % 2 == 0 else "foliage2"
         o = mksph("foliage", fx, fy, fz, fr)
         asgn(fmat, o); objs.append(o)
-    return objs
+    return collapse_meshes(objs, "tree")
 
 
 for bi in range(N):
@@ -851,7 +867,7 @@ def make_bench(cx, cz, ry=0):
     # Back rest
     o = mkbox("bback", cx, SWH + LEG_H + 0.17, cz + 0.24, 2.0, 0.45, 0.08, ry=ry)
     asgn("bench_m", o); objs.append(o)
-    return objs
+    return collapse_meshes(objs, "bench")
 
 
 def make_trash_can(cx, cz):
@@ -862,7 +878,7 @@ def make_trash_can(cx, cz):
     # Lid ring
     o = mkcyl("lid", cx, SWH + 0.9, cz, 0.27, 0.06)
     asgn("drk_mat", o); objs.append(o)
-    return objs
+    return collapse_meshes(objs, "trashcan")
 
 
 def make_lamp_post(cx, cz):
@@ -877,7 +893,7 @@ def make_lamp_post(cx, cz):
     # Glowing cap (sphere)
     o = mksph("lampgl", cx + 0.8, SWH + 6.5, cz, 0.25)
     asgn("lamp_gl", o); objs.append(o)
-    return objs
+    return collapse_meshes(objs, "lamppost")
 
 
 # Place furniture at regular intervals along sidewalks
@@ -954,7 +970,7 @@ def make_car(cx, cz, ry=0, paint=None):
                       cx + wx_off, wheel_by, cz + wz_off2,
                       WHEEL_R, WHEEL_T, rz_=90)
             asgn("tire_c", o); objs.append(o)
-    return objs
+    return collapse_meshes(objs, "car")
 
 
 # Scatter cars: parked along road edges and a few "driving" mid-lane
@@ -1014,7 +1030,7 @@ def make_coffee_shop(cx, fz, w):
     # Coffee sign panel
     o = mkbox("csign", cx, 2.6, fz - 0.15, min(w * 0.6, 3.0), 0.6, 0.1)
     asgn("sign_m", o); objs.append(o)
-    return objs
+    return collapse_meshes(objs, "shop_coffee")
 
 
 def make_restaurant(cx, fz, w):
@@ -1029,7 +1045,7 @@ def make_restaurant(cx, fz, w):
     # Planter (green box)
     o = mkbox("plntr", cx + w * 0.25, SWH, fz - 2.0, 0.8, 0.5, 0.8)
     asgn("planter_m", o); objs.append(o)
-    return objs
+    return collapse_meshes(objs, "shop_rest")
 
 
 def make_barbershop(cx, fz, w):
@@ -1045,7 +1061,7 @@ def make_barbershop(cx, fz, w):
     # Sign
     o = mkbox("bsign", cx, 2.6, fz - 0.15, min(w * 0.55, 2.5), 0.55, 0.1)
     asgn("sign_m", o); objs.append(o)
-    return objs
+    return collapse_meshes(objs, "shop_barber")
 
 
 def make_club(cx, fz, w):
@@ -1062,7 +1078,7 @@ def make_club(cx, fz, w):
     # Rope between posts
     o = mkbox("rope", cx, SWH + 1.0, fz - 2.5, 3.0, 0.06, 0.06)
     asgn("rope_m", o); objs.append(o)
-    return objs
+    return collapse_meshes(objs, "shop_club")
 
 
 STORE_FN = {
@@ -1131,7 +1147,7 @@ def make_crane(cx, cz, h=40.0, jib_len=18.0):
     # Hook
     o = mkbox("chook", tr_x, SWH, cz, 0.3, 0.5, 0.3)
     asgn("metal", o); objs.append(o)
-    return objs
+    return collapse_meshes(objs, "crane")
 
 
 # Place 8 cranes at scattered block positions
@@ -1176,7 +1192,7 @@ def make_hydrant(cx, cz):
     for side in (-1, 1):
         o = mkcyl("hyd_n", cx + side * 0.22, SWH + 0.3, cz, 0.07, 0.2, rz_=90)
         asgn("hydrant_m", o); objs.append(o)
-    return objs
+    return collapse_meshes(objs, "hydrant")
 
 
 def make_dumpster(cx, cz, ry=0):
@@ -1188,7 +1204,7 @@ def make_dumpster(cx, cz, ry=0):
     # Open interior (just show rim — thin top frame)
     o = mkbox("dumplid", cx, SWH + 1.2, cz, 2.6, 0.1, 1.3, ry=ry)
     asgn("drk_mat", o); objs.append(o)
-    return objs
+    return collapse_meshes(objs, "dumpster")
 
 
 def make_power_pole(cx, cz):
@@ -1204,7 +1220,7 @@ def make_power_pole(cx, cz):
     for lx in (-1.6, 1.6):
         o = mkcyl("pins", cx + lx, 8.95, cz, 0.06, 0.2)
         asgn("wht_mat", o); objs.append(o)
-    return objs
+    return collapse_meshes(objs, "powerpole")
 
 
 # Scatter misc details across sidewalks
