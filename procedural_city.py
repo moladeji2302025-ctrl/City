@@ -1,1273 +1,953 @@
 """
 procedural_city.py
 ==================
-Production-ready Maya Python script for procedural city generation.
+Optimized Maya procedural city generator.
 
-Generates a heavily detailed, stylized modern city on a 20x20 block grid.
-Run this script inside the Maya Script Editor (Python tab).
+Performance optimizations implemented:
+- 12x12 grid with higher in-block density (~2,500+ buildings total)
+- Asset instancing for repeated objects (windows, trees, cars, traffic lights,
+  and street furniture)
+- Lower-poly repeated assets (trees, cars, roof details, crane)
+- Road-marking batching (combined per-road/per-intersection meshes)
+- Viewport suspension during generation via cmds.refresh(suspend=True)
+- Progress prints every 20%
+- Material reuse cache (no duplicate shaders)
+- QUALITY slider ("medium" / "low")
+- Periodic cmds.cleanupScene() calls
 
-Requirements:
-    Maya 2018+ with standard polygon tools available.
-    Sufficient RAM recommended (large scene: ~80 000+ objects).
+Run in Maya Script Editor (Python tab).
 
-Usage:
-    Copy-paste entire file into Maya Script Editor and execute,
-    OR run via: import procedural_city (if placed in PYTHONPATH).
-
-Random seed 42 ensures reproducible results.
+WARNING:
+This script starts by running cmds.file(newFile=True, force=True), which
+clears the current Maya scene without prompting to save.
 """
 
-import maya.cmds as cmds
 import random
-import math
+import maya.cmds as cmds
 
-# =============================================================================
-# SEED & GLOBAL CONFIGURATION
-# =============================================================================
+
+# -----------------------------------------------------------------------------
+# GLOBAL SETTINGS
+# -----------------------------------------------------------------------------
 random.seed(42)
+QUALITY = "medium"  # "medium" or "low"
 
-BLOCK_SIZE  = 50        # Each city block footprint (units)
-ROAD_W      = 8         # Road width (units)
-SW_W        = 2         # Sidewalk width on each side (units)
-STREET_MOD  = ROAD_W + SW_W * 2    # Total street module width  = 12
-MODULE      = BLOCK_SIZE + STREET_MOD   # City-cell size  = 62
-N           = 20        # Grid dimension  (20x20 blocks)
-CITY_SZ     = N * MODULE + STREET_MOD  # Total city footprint  = 1252
-OX          = -CITY_SZ / 2.0           # City world X origin  = -626
-OZ          = -CITY_SZ / 2.0           # City world Z origin  = -626
-MASTER      = "Procedural_City"        # Name of the root group
+BLOCK_SIZE = 50
+ROAD_W = 8
+SW_W = 2
+STREET_MOD = ROAD_W + SW_W * 2
+MODULE = BLOCK_SIZE + STREET_MOD
+N = 12  # reduced from 20 for better viewport/memory reliability; density increased below
+CITY_SZ = N * MODULE + STREET_MOD
+OX = -CITY_SZ / 2.0
+OZ = -CITY_SZ / 2.0
+MASTER = "Procedural_City"
 
-# =============================================================================
-# UNIQUE-NAME COUNTER
-# =============================================================================
+# 6x6 placement grid per block with 18 buildings/block => 2592 buildings total
+SUBDIV = 6
+CELL_SZ = BLOCK_SIZE / float(SUBDIV)
+BUILDINGS_PER_BLOCK = 18
+
+# Window/roof complexity switches for QUALITY
+LOW_QUALITY = QUALITY.lower() == "low"
+WINDOW_DEPTH = 0.01 if LOW_QUALITY else 0.08
+ENABLE_ROOF_DETAILS = not LOW_QUALITY
+
+
+# -----------------------------------------------------------------------------
+# HELPERS
+# -----------------------------------------------------------------------------
 _cnt = [0]
+_mats = {}
+_groups = {}
+_prototypes = {}
+_entrances = []
 
 
 def uid(prefix):
-    """Return a unique object name: prefix_NNNNN."""
     _cnt[0] += 1
     return "{}_{:05d}".format(prefix, _cnt[0])
 
 
-# =============================================================================
-# POSITION HELPERS
-# =============================================================================
 def blk_ox(i):
-    """Left-edge X of block column i."""
     return OX + i * MODULE + STREET_MOD
 
 
 def blk_oz(j):
-    """Front-edge Z of block row j."""
     return OZ + j * MODULE + STREET_MOD
 
 
 def blk_cx(i):
-    """Center X of block column i."""
     return blk_ox(i) + BLOCK_SIZE * 0.5
 
 
 def blk_cz(j):
-    """Center Z of block row j."""
     return blk_oz(j) + BLOCK_SIZE * 0.5
 
 
 def road_cx(col):
-    """Center X of the vertical road at column col  (0 .. N)."""
     return OX + col * MODULE + STREET_MOD * 0.5
 
 
 def road_cz(row):
-    """Center Z of the horizontal road at row  (0 .. N)."""
     return OZ + row * MODULE + STREET_MOD * 0.5
 
 
-# =============================================================================
-# GEOMETRY PRIMITIVES  (all Y coords are *bottom* of the object unless noted)
-# =============================================================================
-def mkbox(nm, cx, by, cz, w, h, d, ry=0):
-    """Create a polyCube.  Bottom at y=by, centre at (cx, -, cz)."""
-    o = cmds.polyCube(w=w, h=h, d=d, sx=1, sy=1, sz=1, name=uid(nm))[0]
+def mkbox(prefix, cx, by, cz, w, h, d, ry=0):
+    o = cmds.polyCube(w=w, h=h, d=d, sx=1, sy=1, sz=1, name=uid(prefix))[0]
     cmds.move(cx, by + h * 0.5, cz, o)
     if ry:
         cmds.rotate(0, ry, 0, o, r=True)
     return o
 
 
-def mkcyl(nm, cx, by, cz, r, h, ry=0, rx_=0, rz_=0):
-    """Create a polyCylinder.  Bottom at y=by."""
-    o = cmds.polyCylinder(r=r, h=h, sc=0, sx=8, sy=1, name=uid(nm))[0]
+def mkcyl(prefix, cx, by, cz, r, h, ry=0, rz=0, sx=6):
+    # Low segment count for repeated geometry
+    o = cmds.polyCylinder(r=r, h=h, sx=sx, sy=1, sz=1, name=uid(prefix))[0]
     cmds.move(cx, by + h * 0.5, cz, o)
-    if rx_:
-        cmds.rotate(rx_, 0, 0, o, r=True)
     if ry:
         cmds.rotate(0, ry, 0, o, r=True)
-    if rz_:
-        cmds.rotate(0, 0, rz_, o, r=True)
+    if rz:
+        cmds.rotate(0, 0, rz, o, r=True)
     return o
 
 
-def mksph(nm, cx, cy, cz, r):
-    """Create a polySphere centred at (cx, cy, cz)."""
-    o = cmds.polySphere(r=r, sx=8, sy=6, name=uid(nm))[0]
+def mksph(prefix, cx, cy, cz, r, sx=6, sy=4):
+    o = cmds.polySphere(r=r, sx=sx, sy=sy, name=uid(prefix))[0]
     cmds.move(cx, cy, cz, o)
     return o
 
 
-# =============================================================================
-# MATERIAL HELPERS
-# =============================================================================
-_sg = {}   # shader_name -> shading_group_name
-
-
-def mkmat(nm, r, g, b, typ="lambert", sp=None):
-    """Create (or reuse) a Lambert / Phong shader and its SG."""
-    if nm in _sg:
-        return
-    m = cmds.shadingNode(typ, asShader=True, name=nm)
-    cmds.setAttr(m + ".color", r, g, b, type="double3")
-    if typ == "phong" and sp:
-        cmds.setAttr(m + ".specularColor", sp[0], sp[1], sp[2], type="double3")
-        cmds.setAttr(m + ".cosinePower", 25)
-    sg = cmds.sets(renderable=True, noSurfaceShader=True,
-                   empty=True, name=nm + "_SG")
-    cmds.connectAttr(m + ".outColor", sg + ".surfaceShader", force=True)
-    _sg[nm] = sg
-
-
-def asgn(mat, obj):
-    """Assign material to a mesh object."""
-    sg = _sg.get(mat)
-    if sg and cmds.objExists(obj):
-        try:
-            cmds.sets(obj, edit=True, forceElement=sg)
-        except Exception:
-            pass
-
-
-# =============================================================================
-# CREATE ALL MATERIALS
-# =============================================================================
-print("Creating materials...")
-
-# -- Infrastructure --
-mkmat("asphalt",   0.15, 0.15, 0.15)
-mkmat("concrete",  0.50, 0.50, 0.50)
-mkmat("sidewalk",  0.73, 0.71, 0.65)
-mkmat("rdline",    0.95, 0.95, 0.85)
-mkmat("crsswlk",   0.88, 0.88, 0.78)
-
-# -- Building shells --
-mkmat("stone",     0.60, 0.55, 0.50)
-mkmat("brick",     0.68, 0.33, 0.20)
-mkmat("metal",     0.62, 0.65, 0.70, "phong", (0.30, 0.30, 0.30))
-mkmat("glass",     0.42, 0.62, 0.85, "phong", (0.50, 0.50, 0.50))
-mkmat("glassd",    0.18, 0.28, 0.42, "phong", (0.40, 0.40, 0.40))
-mkmat("wht_mat",   0.90, 0.90, 0.90)
-mkmat("drk_mat",   0.12, 0.12, 0.15)
-
-# -- Building body colours --
-BLDG_MATS = [
-    "bb_beige", "bb_cream", "bb_gray", "bb_bronze",
-    "bb_blue",  "bb_terra", "bb_olv", "brick"
-]
-mkmat("bb_beige",  0.85, 0.80, 0.68)
-mkmat("bb_cream",  0.92, 0.90, 0.78)
-mkmat("bb_gray",   0.60, 0.63, 0.67)
-mkmat("bb_bronze", 0.65, 0.50, 0.30)
-mkmat("bb_blue",   0.32, 0.48, 0.68)
-mkmat("bb_terra",  0.72, 0.38, 0.26)
-mkmat("bb_olv",    0.52, 0.56, 0.38)
-
-# -- Nature --
-mkmat("foliage",   0.16, 0.50, 0.16)
-mkmat("foliage2",  0.20, 0.58, 0.22)
-mkmat("trunk_c",   0.40, 0.27, 0.12)
-
-# -- Cars --
-CAR_MATS = ["car_r", "car_b", "car_s", "car_k", "car_w"]
-mkmat("car_r",     0.80, 0.10, 0.10)
-mkmat("car_b",     0.10, 0.20, 0.72)
-mkmat("car_s",     0.76, 0.78, 0.80, "phong", (0.25, 0.25, 0.25))
-mkmat("car_k",     0.06, 0.06, 0.07)
-mkmat("car_w",     0.93, 0.93, 0.95)
-mkmat("car_win",   0.30, 0.48, 0.72, "phong", (0.40, 0.40, 0.40))
-mkmat("tire_c",    0.08, 0.08, 0.08)
-
-# -- Traffic lights --
-mkmat("lt_red",    1.00, 0.04, 0.04)
-mkmat("lt_yel",    1.00, 0.84, 0.04)
-mkmat("lt_grn",    0.04, 0.88, 0.04)
-mkmat("pole_m",    0.28, 0.30, 0.33)
-
-# -- Street furniture --
-mkmat("bench_m",   0.52, 0.38, 0.18)
-mkmat("trash_m",   0.20, 0.28, 0.20)
-mkmat("lamp_m",    0.24, 0.24, 0.26, "phong", (0.15, 0.15, 0.15))
-mkmat("lamp_gl",   1.00, 0.93, 0.72)
-
-# -- Misc scene details --
-mkmat("manhole_m", 0.12, 0.12, 0.12)
-mkmat("hydrant_m", 0.76, 0.08, 0.08)
-mkmat("dumpster_m",0.20, 0.50, 0.20)
-mkmat("wood_m",    0.48, 0.33, 0.16)
-mkmat("crane_y",   0.95, 0.74, 0.08)
-mkmat("crane_k",   0.10, 0.10, 0.12)
-mkmat("cable_m",   0.22, 0.22, 0.22)
-mkmat("awning_r",  0.80, 0.15, 0.15)
-mkmat("awning_b",  0.15, 0.25, 0.70)
-mkmat("sign_m",    0.95, 0.85, 0.20)
-mkmat("barber_r",  0.85, 0.10, 0.10)
-mkmat("barber_w",  0.90, 0.90, 0.90)
-mkmat("barber_b",  0.10, 0.20, 0.70)
-mkmat("planter_m", 0.30, 0.45, 0.20)
-mkmat("rope_m",    0.60, 0.48, 0.22)
-
-# -- Billboards (neon colours) --
-BILL_MATS = ["bill_r", "bill_c", "bill_y", "bill_m", "bill_g"]
-mkmat("bill_r",    0.95, 0.25, 0.05)
-mkmat("bill_c",    0.05, 0.75, 0.95)
-mkmat("bill_y",    0.95, 0.85, 0.08)
-mkmat("bill_m",    0.90, 0.10, 0.75)
-mkmat("bill_g",    0.10, 0.88, 0.30)
-mkmat("bill_sp",   0.30, 0.32, 0.35)
-
-print("  {} shading groups created.".format(len(_sg)))
-
-
-# =============================================================================
-# MASTER GROUP & SUB-GROUP HELPERS
-# =============================================================================
-if cmds.objExists(MASTER):
-    cmds.delete(MASTER)
-master = cmds.group(em=True, name=MASTER)
-
-_grps = {}
-
-
-def get_grp(name):
-    """Return (creating if needed) a named child group of master."""
-    if name not in _grps:
-        g = cmds.group(em=True, name=name)
-        cmds.parent(g, master)
-        _grps[name] = g
-    return _grps[name]
-
-
-def put(objs, gname):
-    """Parent a list of objects into a named sub-group."""
-    g = get_grp(gname)
-    for o in objs:
-        if o and cmds.objExists(o):
-            try:
-                cmds.parent(o, g)
-            except Exception:
-                pass
-
-
-def collapse_meshes(objs, prefix):
-    """Merge related mesh pieces into one object to reduce scene object count."""
+def combine(objs, prefix):
     valid = [o for o in objs if o and cmds.objExists(o)]
     if not valid:
-        return []
+        return None
     if len(valid) == 1:
-        return valid
+        return valid[0]
+    return cmds.polyUnite(valid, ch=False, mergeUVSets=True, name=uid(prefix))[0]
+
+
+def ensure_material(name, color, typ="lambert", spec=None):
+    if name in _mats:
+        return _mats[name]
+    mat = cmds.shadingNode(typ, asShader=True, name=name)
+    cmds.setAttr(mat + ".color", color[0], color[1], color[2], type="double3")
+    if typ == "phong" and spec:
+        cmds.setAttr(mat + ".specularColor", spec[0], spec[1], spec[2], type="double3")
+        cmds.setAttr(mat + ".cosinePower", 20)
+    sg = cmds.sets(renderable=True, noSurfaceShader=True, empty=True, name=name + "_SG")
+    cmds.connectAttr(mat + ".outColor", sg + ".surfaceShader", force=True)
+    _mats[name] = sg
+    return sg
+
+
+def assign(mat, obj):
+    sg = _mats.get(mat)
+    if sg and obj and cmds.objExists(obj):
+        cmds.sets(obj, edit=True, forceElement=sg)
+
+
+def get_group(name):
+    if name not in _groups:
+        g = cmds.group(em=True, name=name)
+        cmds.parent(g, MASTER)
+        _groups[name] = g
+    return _groups[name]
+
+
+def put(objs, group_name):
+    if not objs:
+        return
+    g = get_group(group_name)
+    for o in objs:
+        if o and cmds.objExists(o):
+            cmds.parent(o, g)
+
+
+def periodic_cleanup(label):
     try:
-        merged = cmds.polyUnite(valid, ch=False, mergeUVSets=True, name=uid(prefix))[0]
-        return [merged]
-    except RuntimeError:
-        # If Maya cannot merge a specific object set, keep the original pieces.
-        return valid
+        cmds.cleanupScene()
+        print("  cleanupScene() called after {}".format(label))
+    except Exception:
+        pass
 
 
-# =============================================================================
-# SECTION 1: GROUND PLANE
-# =============================================================================
-print("Section 1: Ground plane...")
-gnd = mkbox("ground", 0, -0.1, 0, CITY_SZ, 0.1, CITY_SZ)
-asgn("asphalt", gnd)
-put([gnd], "Grp_Ground")
+def progress(pct, label):
+    print("[Progress] {}% - {}".format(pct, label))
 
 
-# =============================================================================
-# SECTION 2: ROADS
-# =============================================================================
-print("Section 2: Roads...")
-road_objs = []
-
-# Vertical roads run the full city length along Z, one per column
-for col in range(N + 1):
-    o = mkbox("road_v", road_cx(col), 0, 0, ROAD_W, 0.05, CITY_SZ)
-    asgn("asphalt", o)
-    road_objs.append(o)
-
-# Horizontal roads run the full city length along X, one per row
-for row in range(N + 1):
-    o = mkbox("road_h", 0, 0, road_cz(row), CITY_SZ, 0.05, ROAD_W)
-    asgn("asphalt", o)
-    road_objs.append(o)
-
-put(road_objs, "Grp_Roads")
-print("  Roads placed: {}".format(len(road_objs)))
+def register_prototype(name, obj):
+    _prototypes[name] = obj
+    cmds.parent(obj, get_group("Grp_Prototypes"))
+    cmds.setAttr(obj + ".visibility", 0)
 
 
-# =============================================================================
-# SECTION 3: SIDEWALKS
-# =============================================================================
-print("Section 3: Sidewalks...")
-sw_objs = []
-SWH = 0.15   # sidewalk raise height
-
-for col in range(N + 1):
-    cx = road_cx(col)
-    for side in (-1, 1):
-        sx = cx + side * (ROAD_W * 0.5 + SW_W * 0.5)
-        o = mkbox("sw_v", sx, 0, 0, SW_W, SWH, CITY_SZ)
-        asgn("sidewalk", o)
-        sw_objs.append(o)
-
-for row in range(N + 1):
-    cz = road_cz(row)
-    for side in (-1, 1):
-        sz = cz + side * (ROAD_W * 0.5 + SW_W * 0.5)
-        o = mkbox("sw_h", 0, 0, sz, CITY_SZ, SWH, SW_W)
-        asgn("sidewalk", o)
-        sw_objs.append(o)
-
-put(sw_objs, "Grp_Sidewalks")
-print("  Sidewalk strips: {}".format(len(sw_objs)))
+def instance_proto(name, cx, by, cz, ry=0, scale=(1, 1, 1), parent_group=None):
+    inst = cmds.instance(_prototypes[name], name=uid(name + "_i"))[0]
+    cmds.move(cx, by, cz, inst, absolute=True)
+    if ry:
+        cmds.rotate(0, ry, 0, inst, r=True)
+    if scale != (1, 1, 1):
+        cmds.scale(scale[0], scale[1], scale[2], inst, absolute=True)
+    if parent_group:
+        cmds.parent(inst, get_group(parent_group))
+    return inst
 
 
-# =============================================================================
-# SECTION 4: ROAD MARKINGS  (centre dashes, edge lines, crosswalks)
-# =============================================================================
-print("Section 4: Road markings...")
-mrk_objs = []
+# -----------------------------------------------------------------------------
+# MATERIALS (reused)
+# -----------------------------------------------------------------------------
+def create_materials():
+    ensure_material("asphalt", (0.15, 0.15, 0.15))
+    ensure_material("concrete", (0.50, 0.50, 0.50))
+    ensure_material("sidewalk", (0.73, 0.71, 0.65))
+    ensure_material("rdline", (0.95, 0.95, 0.85))
+    ensure_material("crsswlk", (0.88, 0.88, 0.78))
 
-DASH_W, DASH_L, DASH_GAP, DASH_H = 0.30, 3.5, 2.5, 0.06
+    ensure_material("stone", (0.60, 0.55, 0.50))
+    ensure_material("brick", (0.68, 0.33, 0.20))
+    ensure_material("metal", (0.62, 0.65, 0.70), "phong", (0.28, 0.28, 0.28))
+    ensure_material("glass", (0.42, 0.62, 0.85), "phong", (0.50, 0.50, 0.50))
+    ensure_material("glassd", (0.20, 0.30, 0.45), "phong", (0.35, 0.35, 0.35))
+    ensure_material("dark", (0.10, 0.10, 0.12))
+    ensure_material("white", (0.90, 0.90, 0.90))
 
-# Dashed centre lines on vertical roads
-for col in range(N + 1):
-    cx = road_cx(col)
-    z = OZ
-    while z < OZ + CITY_SZ:
-        o = mkbox("dash", cx, 0, z + DASH_L * 0.5, DASH_W, DASH_H, DASH_L)
-        asgn("rdline", o)
-        mrk_objs.append(o)
-        z += DASH_L + DASH_GAP
+    for n, c in {
+        "bb_beige": (0.85, 0.80, 0.68),
+        "bb_cream": (0.92, 0.90, 0.78),
+        "bb_gray": (0.60, 0.63, 0.67),
+        "bb_bronze": (0.65, 0.50, 0.30),
+        "bb_blue": (0.32, 0.48, 0.68),
+        "bb_terra": (0.72, 0.38, 0.26),
+        "bb_olive": (0.52, 0.56, 0.38),
+        "bb_charcoal": (0.26, 0.28, 0.30),
+    }.items():
+        ensure_material(n, c)
 
-# Dashed centre lines on horizontal roads
-for row in range(N + 1):
-    cz = road_cz(row)
-    x = OX
-    while x < OX + CITY_SZ:
-        o = mkbox("dash", x + DASH_L * 0.5, 0, cz, DASH_L, DASH_H, DASH_W)
-        asgn("rdline", o)
-        mrk_objs.append(o)
-        x += DASH_L + DASH_GAP
+    ensure_material("foliage", (0.18, 0.52, 0.18))
+    ensure_material("foliage2", (0.22, 0.58, 0.24))
+    ensure_material("trunk", (0.40, 0.27, 0.12))
 
-# Solid edge lines along both sides of every road
-EW, EH = 0.15, 0.06
-for col in range(N + 1):
-    cx = road_cx(col)
-    for side in (-1, 1):
-        ex = cx + side * ROAD_W * 0.42
-        o = mkbox("edge", ex, 0, 0, EW, EH, CITY_SZ)
-        asgn("rdline", o)
-        mrk_objs.append(o)
+    ensure_material("car_r", (0.80, 0.10, 0.10))
+    ensure_material("car_b", (0.10, 0.20, 0.72))
+    ensure_material("car_s", (0.76, 0.78, 0.80), "phong", (0.24, 0.24, 0.24))
+    ensure_material("car_k", (0.06, 0.06, 0.07))
+    ensure_material("car_w", (0.93, 0.93, 0.95))
+    ensure_material("car_win", (0.30, 0.48, 0.72), "phong", (0.40, 0.40, 0.40))
 
-for row in range(N + 1):
-    cz = road_cz(row)
-    for side in (-1, 1):
-        ez = cz + side * ROAD_W * 0.42
-        o = mkbox("edge", 0, 0, ez, CITY_SZ, EH, EW)
-        asgn("rdline", o)
-        mrk_objs.append(o)
+    ensure_material("lt_red", (1.00, 0.04, 0.04))
+    ensure_material("lt_yel", (1.00, 0.84, 0.04))
+    ensure_material("lt_grn", (0.04, 0.88, 0.04))
+    ensure_material("pole", (0.28, 0.30, 0.33))
 
-# Crosswalks at every intersection (striped white rectangles)
-CW_N    = 5            # stripes per crossing direction
-CW_W    = 0.70         # stripe width
-CW_H    = 0.07         # stripe height
-CW_L    = ROAD_W * 0.85  # stripe length
-CW_SP   = 1.10         # stripe spacing
+    ensure_material("bench", (0.52, 0.38, 0.18))
+    ensure_material("trash", (0.20, 0.28, 0.20))
+    ensure_material("lamp", (0.24, 0.24, 0.26), "phong", (0.15, 0.15, 0.15))
+    ensure_material("lamp_gl", (1.00, 0.93, 0.72))
 
-for col in range(N + 1):
+    ensure_material("manhole", (0.12, 0.12, 0.12))
+    ensure_material("hydrant", (0.76, 0.08, 0.08))
+    ensure_material("dumpster", (0.20, 0.50, 0.20))
+    ensure_material("wood", (0.48, 0.33, 0.16))
+
+    ensure_material("crane_y", (0.95, 0.74, 0.08))
+    ensure_material("crane_dark", (0.10, 0.10, 0.12))
+    ensure_material("cable", (0.22, 0.22, 0.22))
+
+    ensure_material("awning_r", (0.80, 0.15, 0.15))
+    ensure_material("awning_b", (0.15, 0.25, 0.70))
+    ensure_material("sign", (0.95, 0.85, 0.20))
+    ensure_material("barber_r", (0.85, 0.10, 0.10))
+    ensure_material("barber_w", (0.90, 0.90, 0.90))
+    ensure_material("barber_b", (0.10, 0.20, 0.70))
+    ensure_material("planter", (0.30, 0.45, 0.20))
+    ensure_material("rope", (0.60, 0.48, 0.22))
+
+    ensure_material("bill_r", (0.95, 0.25, 0.05))
+    ensure_material("bill_c", (0.05, 0.75, 0.95))
+    ensure_material("bill_y", (0.95, 0.85, 0.08))
+    ensure_material("bill_m", (0.90, 0.10, 0.75))
+    ensure_material("bill_g", (0.10, 0.88, 0.30))
+    ensure_material("bill_sp", (0.30, 0.32, 0.35))
+
+
+# -----------------------------------------------------------------------------
+# PROTOTYPES (instancing targets)
+# -----------------------------------------------------------------------------
+def create_prototypes():
+    # Window
+    w = mkbox("proto_window", 0, 0, 0, 0.8, 1.0, WINDOW_DEPTH)
+    assign("glassd" if LOW_QUALITY else "glass", w)
+    register_prototype("window", w)
+
+    # Tree (low-poly)
+    tree_parts = []
+    trunk = mkcyl("proto_tree_trunk", 0, 0, 0, 0.22, 3.0, sx=6)
+    assign("trunk", trunk)
+    tree_parts.append(trunk)
+    if LOW_QUALITY:
+        cap = mkcyl("proto_tree_cap", 0, 2.8, 0, 1.2, 1.8, sx=6)
+        assign("foliage", cap)
+        tree_parts.append(cap)
+    else:
+        cap1 = mksph("proto_tree_cap", 0, 3.6, 0, 1.2, sx=6, sy=4)
+        cap2 = mksph("proto_tree_cap", 0.3, 4.2, 0.2, 0.9, sx=6, sy=4)
+        assign("foliage", cap1)
+        assign("foliage2", cap2)
+        tree_parts.extend([cap1, cap2])
+    tree = combine(tree_parts, "proto_tree")
+    register_prototype("tree", tree)
+
+    # Traffic light
+    tl_parts = []
+    pole = mkcyl("proto_tl_pole", 0, 0, 0, 0.12, 5.5, sx=6)
+    assign("pole", pole)
+    tl_parts.append(pole)
+    arm = mkbox("proto_tl_arm", 0.6, 5.5, 0, 1.2, 0.12, 0.12)
+    assign("pole", arm)
+    tl_parts.append(arm)
+    box = mkbox("proto_tl_box", 1.2, 4.4, 0, 0.34, 1.15, 0.34)
+    assign("dark", box)
+    tl_parts.append(box)
+    for y, mat in ((5.7, "lt_red"), (5.3, "lt_yel"), (4.9, "lt_grn")):
+        l = mkcyl("proto_tl_light", 1.2, y, 0, 0.11, 0.10, sx=6)
+        assign(mat, l)
+        tl_parts.append(l)
+    tl = combine(tl_parts, "proto_tlight")
+    register_prototype("traffic_light", tl)
+
+    # Bench
+    bench_parts = []
+    for lx in (-0.8, 0.8):
+        o = mkbox("proto_bench_leg", lx, 0, 0, 0.10, 0.35, 0.55)
+        assign("metal", o)
+        bench_parts.append(o)
+    seat = mkbox("proto_bench_seat", 0, 0.35, 0, 2.0, 0.12, 0.60)
+    back = mkbox("proto_bench_back", 0, 0.52, 0.24, 2.0, 0.42, 0.08)
+    assign("bench", seat)
+    assign("bench", back)
+    bench_parts.extend([seat, back])
+    bench = combine(bench_parts, "proto_bench")
+    register_prototype("bench", bench)
+
+    # Trash can
+    trash_parts = []
+    tc = mkcyl("proto_trash", 0, 0, 0, 0.25, 0.9, sx=6)
+    lid = mkcyl("proto_trash_lid", 0, 0.9, 0, 0.27, 0.06, sx=6)
+    assign("trash", tc)
+    assign("dark", lid)
+    trash_parts.extend([tc, lid])
+    register_prototype("trash", combine(trash_parts, "proto_trashcan"))
+
+    # Lamp post
+    lamp_parts = []
+    lp = mkcyl("proto_lamp_pole", 0, 0, 0, 0.08, 6.5, sx=6)
+    la = mkbox("proto_lamp_arm", 0.4, 6.5, 0, 0.8, 0.08, 0.08)
+    lg = mksph("proto_lamp_gl", 0.8, 6.5, 0, 0.22, sx=6, sy=4)
+    assign("lamp", lp)
+    assign("lamp", la)
+    assign("lamp_gl", lg)
+    lamp_parts.extend([lp, la, lg])
+    register_prototype("lamp", combine(lamp_parts, "proto_lamp"))
+
+    # Simplified car prototypes (no wheel cylinders; wheel arches instead)
+    car_colors = ["car_r", "car_b", "car_s", "car_k", "car_w"]
+    for color in car_colors:
+        cparts = []
+        body = mkbox("proto_car_body", 0, 0, 0, 3.8, 1.0, 1.8)
+        roof = mkbox("proto_car_roof", 0, 1.0, 0, 2.2, 0.65, 1.45)
+        fw = mkbox("proto_car_fw", 0, 1.2, -0.72, 1.8, 0.45, 0.08)
+        rw = mkbox("proto_car_rw", 0, 1.2, 0.72, 1.8, 0.45, 0.08)
+        assign(color, body)
+        assign(color, roof)
+        assign("car_win", fw)
+        assign("car_win", rw)
+        cparts.extend([body, roof, fw, rw])
+        # dark wheel-arch strips on both sides (visual wheel simplification)
+        for zoff in (-0.96, 0.96):
+            ws = mkbox("proto_car_wstrip", 0, 0.05, zoff, 2.8, 0.32, 0.10)
+            assign("dark", ws)
+            cparts.append(ws)
+        car = combine(cparts, "proto_car_" + color)
+        register_prototype(color, car)
+
+
+# -----------------------------------------------------------------------------
+# CITY SECTIONS
+# -----------------------------------------------------------------------------
+def build_ground_roads_sidewalks_markings():
+    # Ground
+    g = mkbox("ground", 0, -0.1, 0, CITY_SZ, 0.1, CITY_SZ)
+    assign("asphalt", g)
+    put([g], "Grp_Ground")
+
+    # Roads
+    roads = []
+    for col in range(N + 1):
+        rv = mkbox("road_v", road_cx(col), 0, 0, ROAD_W, 0.05, CITY_SZ)
+        assign("asphalt", rv)
+        roads.append(rv)
     for row in range(N + 1):
-        ix, iz = road_cx(col), road_cz(row)
-        # Stripes crossing the vertical road (pedestrians walk along X)
-        for k in range(CW_N):
-            zk = iz - (CW_N - 1) * CW_SP * 0.5 + k * CW_SP
-            o = mkbox("cw", ix, 0, zk, CW_L, CW_H, CW_W)
-            asgn("crsswlk", o)
-            mrk_objs.append(o)
-        # Stripes crossing the horizontal road (pedestrians walk along Z)
-        for k in range(CW_N):
-            xk = ix - (CW_N - 1) * CW_SP * 0.5 + k * CW_SP
-            o = mkbox("cw", xk, 0, iz, CW_W, CW_H, CW_L)
-            asgn("crsswlk", o)
-            mrk_objs.append(o)
+        rh = mkbox("road_h", 0, 0, road_cz(row), CITY_SZ, 0.05, ROAD_W)
+        assign("asphalt", rh)
+        roads.append(rh)
+    put(roads, "Grp_Roads")
 
-put(mrk_objs, "Grp_RoadMarkings")
-print("  Road marking pieces: {}".format(len(mrk_objs)))
+    # Sidewalks
+    sidewalks = []
+    swh = 0.15
+    for col in range(N + 1):
+        cx = road_cx(col)
+        for side in (-1, 1):
+            sx = cx + side * (ROAD_W * 0.5 + SW_W * 0.5)
+            sv = mkbox("sw_v", sx, 0, 0, SW_W, swh, CITY_SZ)
+            assign("sidewalk", sv)
+            sidewalks.append(sv)
+    for row in range(N + 1):
+        cz = road_cz(row)
+        for side in (-1, 1):
+            sz = cz + side * (ROAD_W * 0.5 + SW_W * 0.5)
+            sh = mkbox("sw_h", 0, 0, sz, CITY_SZ, swh, SW_W)
+            assign("sidewalk", sh)
+            sidewalks.append(sh)
+    put(sidewalks, "Grp_Sidewalks")
+
+    # Road markings: combine per-road/per-intersection to reduce tiny mesh count
+    d_w, d_l, d_gap, d_h = 0.30, 3.5, 2.5, 0.06
+    marking_objs = []
+
+    for col in range(N + 1):
+        pieces = []
+        cx = road_cx(col)
+        z = OZ
+        while z < OZ + CITY_SZ:
+            d = mkbox("dash", cx, 0, z + d_l * 0.5, d_w, d_h, d_l)
+            assign("rdline", d)
+            pieces.append(d)
+            z += d_l + d_gap
+        for side in (-1, 1):
+            ex = cx + side * ROAD_W * 0.42
+            e = mkbox("edge", ex, 0, 0, 0.15, d_h, CITY_SZ)
+            assign("rdline", e)
+            pieces.append(e)
+        merged = combine(pieces, "mark_v")
+        if merged:
+            marking_objs.append(merged)
+
+    for row in range(N + 1):
+        pieces = []
+        cz = road_cz(row)
+        x = OX
+        while x < OX + CITY_SZ:
+            d = mkbox("dash", x + d_l * 0.5, 0, cz, d_l, d_h, d_w)
+            assign("rdline", d)
+            pieces.append(d)
+            x += d_l + d_gap
+        for side in (-1, 1):
+            ez = cz + side * ROAD_W * 0.42
+            e = mkbox("edge", 0, 0, ez, CITY_SZ, d_h, 0.15)
+            assign("rdline", e)
+            pieces.append(e)
+        merged = combine(pieces, "mark_h")
+        if merged:
+            marking_objs.append(merged)
+
+    cw_n, cw_w, cw_h, cw_l, cw_sp = 5, 0.70, 0.07, ROAD_W * 0.85, 1.10
+    for col in range(N + 1):
+        for row in range(N + 1):
+            pieces = []
+            ix, iz = road_cx(col), road_cz(row)
+            for k in range(cw_n):
+                zk = iz - (cw_n - 1) * cw_sp * 0.5 + k * cw_sp
+                c1 = mkbox("cw", ix, 0, zk, cw_l, cw_h, cw_w)
+                assign("crsswlk", c1)
+                pieces.append(c1)
+            for k in range(cw_n):
+                xk = ix - (cw_n - 1) * cw_sp * 0.5 + k * cw_sp
+                c2 = mkbox("cw", xk, 0, iz, cw_w, cw_h, cw_l)
+                assign("crsswlk", c2)
+                pieces.append(c2)
+            merged = combine(pieces, "mark_x")
+            if merged:
+                marking_objs.append(merged)
+
+    put(marking_objs, "Grp_RoadMarkings")
+    return swh
 
 
-# =============================================================================
-# SECTION 5-6: BUILDINGS
-# =============================================================================
-print("Section 5-6: Buildings (all blocks)...")
-
-# Entrance registry — used later for storefront decoration
-_entrances = []   # each entry: (cx, cz, front_z, bldg_w)
-
-
-# Window column density: 1 column per this many units of building width
-WIN_COL_DIVISOR = 5.0
-
-# -- Window grid helper --
-def add_windows(cx, base_y, cz, w, h, d, style):
-    """Return window cube objects on the front & back faces."""
-    objs  = []
-    wmat  = "glass" if style in ("modern_glass", "futuristic") else "glassd"
-    WW, WH, WD = 0.75, 1.00, 0.12    # width, height, extrusion depth
-    WINDOW_BASE_Y_OFFSET = 2.5
-    WCX = max(1.8, w / WIN_COL_DIVISOR)   # column spacing
-    WRY = 2.2                              # row spacing
-    nx  = max(1, min(4, int((w - 0.5) / WCX)))
-    nf  = max(1, min(4, int((h - WINDOW_BASE_Y_OFFSET) / WRY)))
-    start_y = base_y + WINDOW_BASE_Y_OFFSET
-    for row in range(nf):
-        wy = start_y + row * WRY + WH * 0.5
-        for col in range(nx):
-            wx = cx - (nx - 1) * WCX * 0.5 + col * WCX
-            # Front window
-            o = mkbox("win", wx, wy - WH * 0.5, cz - d * 0.5 - WD * 0.5, WW, WH, WD)
-            asgn(wmat, o); objs.append(o)
-            # Back window
-            o = mkbox("win", wx, wy - WH * 0.5, cz + d * 0.5 + WD * 0.5, WW, WH, WD)
-            asgn(wmat, o); objs.append(o)
-    return objs
+def add_building_windows(cx, base_y, cz, w, h, d, landmark=False):
+    # Instanced thin windows (no full cubes)
+    # Non-landmarks use every-other (even-indexed) back rows to preserve visual density while
+    # reducing far-side instance counts for performance.
+    nx = 4 if landmark else 3
+    ny = 5 if landmark else 3
+    nx = max(2, min(nx, int(max(2.0, w) / 2.0)))
+    ny = max(2, min(ny, int(max(6.0, h) / 5.0)))
+    sx = (w * 0.70) / max(1, nx - 1)
+    sy = (h * 0.65) / max(1, ny)
+    start_x = cx - (nx - 1) * sx * 0.5
+    start_y = base_y + 2.2
+    zf = cz - d * 0.5 - WINDOW_DEPTH * 0.5
+    zb = cz + d * 0.5 + WINDOW_DEPTH * 0.5
+    for iy in range(ny):
+        wy = start_y + iy * sy
+        for ix in range(nx):
+            wx = start_x + ix * sx
+            instance_proto("window", wx, wy + 0.5, zf, parent_group="Grp_Windows")
+            if landmark or (iy % 2 == 0):
+                instance_proto("window", wx, wy + 0.5, zb, ry=180, parent_group="Grp_Windows")
 
 
-# -- Entrance helper --
-def add_entrance(cx, cz, w, d):
-    """Return door-frame, glass door and canopy objects."""
+def add_building_entrance(cx, cz, w, d):
     objs = []
-    fz   = cz - d * 0.5     # front face Z position
-    dw, dh, dd = 1.4, 2.4, 0.15   # door opening size
-    # Door-frame stiles and lintel
+    fz = cz - d * 0.5
+    dw, dh = 1.4, 2.4
     for sx in (-dw * 0.5 - 0.12, dw * 0.5 + 0.12):
-        o = mkbox("dfrm", cx + sx, 0, fz - dd * 0.5, 0.15, dh + 0.2, dd)
-        asgn("metal", o); objs.append(o)
-    o = mkbox("dfrm", cx, dh, fz - dd * 0.5, dw + 0.4, 0.15, dd)
-    asgn("metal", o); objs.append(o)
-    # Door glass
-    o = mkbox("dglass", cx, 0, fz - 0.07, dw, dh, 0.06)
-    asgn("glass", o); objs.append(o)
-    # Canopy / awning
-    aw_d = 1.6
-    o = mkbox("awn", cx, dh + 0.15, fz - aw_d * 0.5, dw + 2.0, 0.2, aw_d)
-    asgn("awning_r", o); objs.append(o)
-    # Record entrance for storefront dressing
+        p = mkbox("dfrm", cx + sx, 0, fz - 0.08, 0.15, dh + 0.2, 0.15)
+        assign("metal", p)
+        objs.append(p)
+    top = mkbox("dfrm", cx, dh, fz - 0.08, dw + 0.4, 0.15, 0.15)
+    door = mkbox("door", cx, 0, fz - 0.04, dw, dh, 0.05)
+    canopy = mkbox("canopy", cx, dh + 0.15, fz - 0.8, dw + 1.8, 0.2, 1.6)
+    assign("metal", top)
+    assign("glass", door)
+    assign("awning_r", canopy)
+    objs.extend([top, door, canopy])
     _entrances.append((cx, cz, fz, w))
     return objs
 
 
-# -- Roof helper (style-dependent) --
 def add_roof(cx, top_y, cz, w, d, style):
-    """Return roof objects appropriate to the architectural style."""
     objs = []
+    # 8 style families
     if style == "art_deco":
-        # Three stepped tiers + central finial
-        tiers = [(w * 0.80, d * 0.80, 1.5),
-                 (w * 0.55, d * 0.55, 1.2),
-                 (w * 0.30, d * 0.30, 1.8)]
-        y = top_y
-        for sw, sd, sh in tiers:
-            o = mkbox("rtier", cx, y, cz, sw, sh, sd)
-            asgn("stone", o); objs.append(o)
-            y += sh
-        o = mkcyl("finial", cx, y, cz, 0.28, 3.0)
-        asgn("metal", o); objs.append(o)
-
+        for i, scale in enumerate((0.84, 0.62, 0.40)):
+            o = mkbox("rtier", cx, top_y + i * 0.8, cz, w * scale, 0.8, d * scale)
+            assign("stone", o)
+            objs.append(o)
     elif style == "modern_glass":
-        # Flat parapet + slim glass railing
-        o = mkbox("par", cx, top_y, cz, w + 0.3, 0.5, d + 0.3)
-        asgn("concrete", o); objs.append(o)
-        for rcx_, rcz_, rw, rd in [
-            (cx,          cz - d * 0.5 - 0.05, w,    0.08),
-            (cx,          cz + d * 0.5 + 0.05, w,    0.08),
-            (cx - w * 0.5 - 0.05, cz,           0.08, d),
-            (cx + w * 0.5 + 0.05, cz,           0.08, d),
-        ]:
-            o = mkbox("rail", rcx_, top_y + 0.5, rcz_, rw, 0.9, rd)
-            asgn("glass", o); objs.append(o)
-
+        p = mkbox("rpar", cx, top_y, cz, w + 0.3, 0.45, d + 0.3)
+        assign("concrete", p)
+        objs.append(p)
     elif style == "brick":
-        # Projecting cornice (2 layers)
-        o = mkbox("crnice", cx, top_y,        cz, w + 0.8, 0.6, d + 0.8)
-        asgn("brick", o); objs.append(o)
-        o = mkbox("crnice", cx, top_y + 0.6,  cz, w + 0.4, 0.4, d + 0.4)
-        asgn("stone", o); objs.append(o)
-
+        c1 = mkbox("cornice", cx, top_y, cz, w + 0.7, 0.55, d + 0.7)
+        c2 = mkbox("cornice", cx, top_y + 0.55, cz, w + 0.35, 0.35, d + 0.35)
+        assign("brick", c1)
+        assign("stone", c2)
+        objs.extend([c1, c2])
     elif style == "futuristic":
-        # Thin metal cap + vertical fins
-        o = mkbox("froof", cx, top_y, cz, w * 0.9, 0.35, d * 0.9)
-        asgn("metal", o); objs.append(o)
-        n_fins = max(2, int(w / 3.5))
-        for k in range(n_fins):
-            # Spread fins evenly across 80 % of building width
-            if n_fins > 1:
-                fx = cx - w * 0.4 + k * (w * 0.8 / (n_fins - 1))
-            else:
-                fx = cx
-            o = mkbox("fin", fx, top_y + 0.35, cz, 0.18,
-                      random.uniform(1.2, 3.5), d * 0.5)
-            asgn("metal", o); objs.append(o)
-
+        m = mkbox("rfut", cx, top_y, cz, w * 0.9, 0.3, d * 0.9)
+        assign("metal", m)
+        objs.append(m)
     elif style == "neogothic":
-        # Corner spires + tall central spire
-        for dx, dz in [(w * 0.35,  d * 0.35),
-                       (-w * 0.35,  d * 0.35),
-                       (w * 0.35, -d * 0.35),
-                       (-w * 0.35, -d * 0.35)]:
-            o = mkcyl("gspire", cx + dx, top_y, cz + dz,
-                      0.22, random.uniform(2.0, 4.5))
-            asgn("stone", o); objs.append(o)
-        o = mkcyl("gcspire", cx, top_y, cz, 0.38, random.uniform(3.5, 7.0))
-        asgn("stone", o); objs.append(o)
+        for dx, dz in ((w * 0.35, d * 0.35), (-w * 0.35, d * 0.35), (w * 0.35, -d * 0.35), (-w * 0.35, -d * 0.35)):
+            s = mkcyl("spire", cx + dx, top_y, cz + dz, 0.18, 2.5, sx=6)
+            assign("stone", s)
+            objs.append(s)
+    elif style == "minimalist":
+        p = mkbox("rmini", cx, top_y, cz, w + 0.2, 0.25, d + 0.2)
+        assign("bb_gray", p)
+        objs.append(p)
+    elif style == "industrial":
+        p = mkbox("rind", cx, top_y, cz, w + 0.2, 0.4, d + 0.2)
+        assign("bb_charcoal", p)
+        objs.append(p)
+    elif style == "postmodern":
+        p1 = mkbox("rpm", cx, top_y, cz, w * 0.95, 0.35, d * 0.95)
+        p2 = mkbox("rpm", cx + w * 0.12, top_y + 0.35, cz - d * 0.12, w * 0.48, 0.35, d * 0.48)
+        assign("bb_blue", p1)
+        assign("bb_beige", p2)
+        objs.extend([p1, p2])
 
-    else:
-        # Default flat parapet
-        o = mkbox("par", cx, top_y, cz, w + 0.2, 0.4, d + 0.2)
-        asgn("concrete", o); objs.append(o)
-
+    if ENABLE_ROOF_DETAILS:
+        # very low-poly roof details
+        if style in ("industrial", "modern_glass", "minimalist"):
+            ac = mkbox("ac", cx, top_y + 0.45, cz, 1.2, 0.6, 0.9)
+            vent = mkcyl("vent", cx + 0.5, top_y + 1.0, cz + 0.3, 0.12, 0.5, sx=6)
+            assign("metal", ac)
+            assign("dark", vent)
+            objs.extend([ac, vent])
+        elif style in ("art_deco", "neogothic"):
+            fin = mkcyl("fin", cx, top_y + 0.5, cz, 0.22, 1.8, sx=6)
+            assign("metal", fin)
+            objs.append(fin)
     return objs
 
 
-# -- Roof-detail helper --
-def add_roof_details(cx, top_y, cz, w, d):
-    """AC units, vents, or satellite dish on rooftop."""
+def build_buildings():
+    styles = [
+        "art_deco", "modern_glass", "brick", "futuristic",
+        "neogothic", "minimalist", "industrial", "postmodern",
+    ]
+    mats = ["bb_beige", "bb_cream", "bb_gray", "bb_bronze", "bb_blue", "bb_terra", "bb_olive", "brick"]
+
+    bldg_objs = []
+    block_index = 0
+
+    effective_per_block = max(4, min(BUILDINGS_PER_BLOCK, SUBDIV * SUBDIV))
+
+    for bi in range(N):
+        for bj in range(N):
+            ox = blk_ox(bi)
+            oz = blk_oz(bj)
+
+            cells = [(r, c) for r in range(SUBDIV) for c in range(SUBDIV)]
+            corner_cells = [(0, 0), (0, SUBDIV - 1), (SUBDIV - 1, 0), (SUBDIV - 1, SUBDIV - 1)]
+            interior = [p for p in cells if p not in corner_cells]
+            random.shuffle(interior)
+            regular_target = max(0, effective_per_block - len(corner_cells))
+            chosen = corner_cells + interior[:regular_target]
+
+            prev_h = -999
+            prev_m = None
+
+            for cr, cc in chosen:
+                cx = ox + (cc + 0.5) * CELL_SZ
+                cz = oz + (cr + 0.5) * CELL_SZ
+                landmark = (cr, cc) in corner_cells
+
+                if landmark:
+                    h = random.uniform(30, 42)
+                    w = random.uniform(6.0, 8.0)
+                    d = random.uniform(6.0, 8.0)
+                    style = random.choice(["art_deco", "neogothic", "postmodern"])
+                    mat = random.choice(["stone", "bb_cream", "bb_gray"])
+                    base_h = 2.0
+                else:
+                    h = random.uniform(8, 28)
+                    if abs(h - prev_h) < 2.0:
+                        h += 2.5
+                    w = random.uniform(4.4, 7.6)
+                    d = random.uniform(4.4, 7.6)
+                    style = random.choice(styles)
+                    mat = random.choice(mats)
+                    if mat == prev_m:
+                        alternatives = [m for m in mats if m != prev_m]
+                        if alternatives:
+                            mat = random.choice(alternatives)
+                    base_h = 1.0
+
+                prev_h = h
+                prev_m = mat
+
+                base = mkbox("bbase", cx, 0, cz, w + 0.5, base_h, d + 0.5)
+                body = mkbox("bbody", cx, base_h, cz, w, h - base_h, d)
+                assign("stone" if landmark else "concrete", base)
+                assign(mat, body)
+                bldg_objs.extend([base, body])
+
+                add_building_windows(cx, base_h, cz, w, h - base_h, d, landmark=landmark)
+                bldg_objs.extend(add_building_entrance(cx, cz, w, d))
+                bldg_objs.extend(add_roof(cx, h, cz, w, d, style))
+
+            block_index += 1
+            # periodic scene cleanup while building the city core
+            if block_index % 24 == 0:
+                periodic_cleanup("{} blocks".format(block_index))
+
+    put(bldg_objs, "Grp_Buildings")
+    print("  Buildings generated: {}".format(N * N * effective_per_block))
+    print("  Entrance records: {}".format(len(_entrances)))
+
+
+def place_traffic_lights():
+    offset = ROAD_W * 0.5 + SW_W * 0.5
+    for col in range(N + 1):
+        for row in range(N + 1):
+            ix, iz = road_cx(col), road_cz(row)
+            corners = [
+                (ix - offset, iz - offset, 0),
+                (ix + offset, iz - offset, 180),
+                (ix - offset, iz + offset, 90),
+                (ix + offset, iz + offset, -90),
+            ]
+            for px, pz, ry in corners:
+                instance_proto("traffic_light", px, 0, pz, ry=ry, parent_group="Grp_TrafficLights")
+
+
+def place_billboards():
+    bcols = ["bill_r", "bill_c", "bill_y", "bill_m", "bill_g"]
     objs = []
-    choice = random.choice(["ac", "vent", "dish", "vent2"])
-    ox_ = cx + random.uniform(-w * 0.28, w * 0.28)
-    oz_ = cz + random.uniform(-d * 0.28, d * 0.28)
-    if choice == "ac":
-        o = mkbox("ac", ox_, top_y, oz_, 1.5, 0.8, 1.0)
-        asgn("metal", o); objs.append(o)
-        o = mkcyl("acex", ox_ + 0.3, top_y + 0.8, oz_, 0.18, 0.5)
-        asgn("drk_mat", o); objs.append(o)
-    elif choice == "vent":
-        o = mkcyl("vent", ox_, top_y, oz_, 0.28, 1.2)
-        asgn("drk_mat", o); objs.append(o)
-    elif choice == "dish":
-        o = mkcyl("dishp", ox_, top_y, oz_, 0.07, 1.0)
-        asgn("metal", o); objs.append(o)
-        o = mkbox("dishb", ox_, top_y + 1.0, oz_, 0.8, 0.07, 0.8)
-        asgn("metal", o); objs.append(o)
-    elif choice == "vent2":
-        for _ in range(2):
-            vx = cx + random.uniform(-w * 0.32, w * 0.32)
-            vz = cz + random.uniform(-d * 0.32, d * 0.32)
-            o = mkcyl("vent", vx, top_y, vz, 0.22, 1.0)
-            asgn("drk_mat", o); objs.append(o)
-    return objs
+    for _ in range(30):
+        col = random.randint(0, N)
+        side = random.choice([-1, 1])
+        cx = road_cx(col) + side * (ROAD_W * 0.5 + SW_W + 0.5)
+        cz = OZ + random.uniform(0.05, 0.95) * CITY_SZ
+        by = 0.15
+        left = mkcyl("bleg", cx - 2.8, 0, cz, 0.16, by + 3.8, sx=6)
+        right = mkcyl("bleg", cx + 2.8, 0, cz, 0.16, by + 3.8, sx=6)
+        f = mkbox("bface", cx, by + 1.0, cz - 0.08, 8.0, 4.0, 0.12)
+        b = mkbox("bface", cx, by + 1.0, cz + 0.08, 8.0, 4.0, 0.12)
+        assign("bill_sp", left)
+        assign("bill_sp", right)
+        assign(random.choice(bcols), f)
+        assign(random.choice(bcols), b)
+        objs.extend([left, right, f, b])
+    put(objs, "Grp_Billboards")
 
 
-# -- Single building constructor --
-def build_regular(cx, cz, w, d, h, style, bmat):
-    """Construct one building; return all mesh objects."""
-    objs = []
-    # Stone/metal base (slightly wider than body)
-    o = mkbox("bbase", cx, 0, cz, w + 0.6, 1.0, d + 0.6)
-    asgn("stone", o); objs.append(o)
-    # Main body
-    o = mkbox("bbody", cx, 1.0, cz, w, h - 1.0, d)
-    asgn(bmat, o); objs.append(o)
-    # Windows
-    objs.extend(add_windows(cx, 1.0, cz, w, h - 1.0, d, style))
-    # Entrance
-    objs.extend(add_entrance(cx, cz, w, d))
-    # Roof
-    objs.extend(add_roof(cx, h, cz, w, d, style))
-    # Rooftop details (AC / vent / dish)
-    if random.random() < 0.65:
-        objs.extend(add_roof_details(cx, h, cz, w, d))
-    return collapse_meshes(objs, "bldg")
+def place_trees(sidewalk_h):
+    for bi in range(N):
+        for bj in range(N):
+            n_trees = random.randint(15, 20)
+            ox = blk_ox(bi)
+            oz = blk_oz(bj)
+            for _ in range(n_trees):
+                edge = random.randint(0, 3)
+                if edge == 0:
+                    tx = ox + random.uniform(2, BLOCK_SIZE - 2)
+                    tz = oz - SW_W * 0.5
+                elif edge == 1:
+                    tx = ox + random.uniform(2, BLOCK_SIZE - 2)
+                    tz = oz + BLOCK_SIZE + SW_W * 0.5
+                elif edge == 2:
+                    tx = ox - SW_W * 0.5
+                    tz = oz + random.uniform(2, BLOCK_SIZE - 2)
+                else:
+                    tx = ox + BLOCK_SIZE + SW_W * 0.5
+                    tz = oz + random.uniform(2, BLOCK_SIZE - 2)
+                # Slight random scaling; entrance zones are sparse enough for flythroughs
+                scl = random.uniform(0.85, 1.15)
+                instance_proto("tree", tx, sidewalk_h, tz, scale=(scl, scl, scl), parent_group="Grp_Trees")
 
 
-# -- Landmark corner building constructor --
-def build_landmark(cx, cz, w, d, h):
-    """Tall, ornate landmark building for block corners."""
-    objs = []
-    style = random.choice(["art_deco", "neogothic"])
-    bmat  = random.choice(["stone", "bb_cream", "bb_gray"])
-
-    # Wide decorative base (2 units tall)
-    o = mkbox("lmbase", cx, 0, cz, w + 1.0, 2.0, d + 1.0)
-    asgn("stone", o); objs.append(o)
-    # Mid-floor band
-    o = mkbox("lmband", cx, h * 0.45, cz, w + 0.5, 0.6, d + 0.5)
-    asgn("stone", o); objs.append(o)
-    # Main body
-    o = mkbox("lmbody", cx, 2.0, cz, w, h - 2.0, d)
-    asgn(bmat, o); objs.append(o)
-    # Windows (more floors since taller)
-    objs.extend(add_windows(cx, 2.0, cz, w, h - 2.0, d, style))
-    # Entrance
-    objs.extend(add_entrance(cx, cz, w, d))
-    # Landmark roof
-    objs.extend(add_roof(cx, h, cz, w, d, style))
-    # Corner turrets (cylindrical)
-    for dx, dz in [(w * 0.5, d * 0.5), (-w * 0.5, d * 0.5),
-                   (w * 0.5, -d * 0.5), (-w * 0.5, -d * 0.5)]:
-        o = mkcyl("turret", cx + dx, 0, cz + dz, 0.7, h * 0.85)
-        asgn("stone", o); objs.append(o)
-        # Turret cap
-        o = mkcyl("tcap", cx + dx, h * 0.85, cz + dz, 0.75, 0.4)
-        asgn("concrete", o); objs.append(o)
-    objs.extend(add_roof_details(cx, h, cz, w, d))
-    return collapse_meshes(objs, "lm_bldg")
-
-
-# -- Place buildings across all 20x20 blocks --
-STYLES   = ["art_deco", "modern_glass", "brick", "futuristic", "neogothic"]
-CELL_SZ  = BLOCK_SIZE / 5.0    # 10 units – 5×5 sub-grid inside each block
-bldg_objs = []
-# Keep track of used building colours per block row to avoid identical adj. heights
-_last_h  = {}   # (bi, bj) -> last height  (simple adjacency guard)
-
-for bi in range(N):
-    for bj in range(N):
-        ox = blk_ox(bi)
-        oz = blk_oz(bj)
-
-        # Corner cells always get landmark buildings
-        corner_cells = {(0, 0), (0, 4), (4, 0), (4, 4)}
-        # Choose 2–6 additional interior cells for regular buildings
-        interior = [(r, c) for r in range(5) for c in range(5)
-                    if (r, c) not in corner_cells]
-        random.shuffle(interior)
-        n_regular = random.randint(2, 6)
-        regular_cells = interior[:n_regular]
-
-        # -- Landmark buildings at corner cells --
-        prev_h = _last_h.get((bi, bj), 0)
-        for cr, cc in corner_cells:
-            cx = ox + (cc + 0.5) * CELL_SZ
-            cz = oz + (cr + 0.5) * CELL_SZ
-            lh = random.uniform(30, 45)
-            # Ensure height differs from previous neighbour (max 20 retries)
-            for _ in range(20):
-                if abs(lh - prev_h) >= 3:
-                    break
-                lh = random.uniform(30, 45)
-            prev_h = lh
-            lw = random.uniform(6, 9)
-            ld = random.uniform(6, 9)
-            bldg_objs.extend(build_landmark(cx, cz, lw, ld, lh))
-
-        # -- Regular buildings at interior cells --
-        prev_mat = None
-        for cr, cc in regular_cells:
-            cx = ox + (cc + 0.5) * CELL_SZ
-            cz = oz + (cr + 0.5) * CELL_SZ
-            h  = random.uniform(8, 30)
-            # Ensure height differs from previous neighbour (max 20 retries)
-            for _ in range(20):
-                if abs(h - prev_h) >= 2:
-                    break
-                h = random.uniform(8, 30)
-            prev_h = h
-            w  = random.uniform(5, CELL_SZ * 0.82)
-            d  = random.uniform(5, CELL_SZ * 0.82)
-            style = random.choice(STYLES)
-            bmat  = random.choice(BLDG_MATS)
-            # Ensure material differs from previous building (max 10 retries)
-            for _ in range(10):
-                if bmat != prev_mat:
-                    break
-                bmat = random.choice(BLDG_MATS)
-            prev_mat = bmat
-            bldg_objs.extend(build_regular(cx, cz, w, d, h, style, bmat))
-
-        _last_h[(bi, bj)] = prev_h
-
-put(bldg_objs, "Grp_Buildings")
-print("  Building objects: {}".format(len(bldg_objs)))
-print("  Entrance records: {}".format(len(_entrances)))
-
-
-# =============================================================================
-# SECTION 7: TRAFFIC LIGHTS  (4 poles per intersection)
-# =============================================================================
-print("Section 7: Traffic lights...")
-tl_objs = []
-
-
-def make_traffic_light(px, pz, facing_x):
-    """One traffic light pole with 3 signal lights."""
-    objs = []
-    # Pole
-    o = mkcyl("tlpole", px, 0, pz, 0.12, 5.5)
-    asgn("pole_m", o); objs.append(o)
-    # Horizontal arm
-    arm_len = 1.2
-    ax = px + (arm_len * 0.5 if facing_x else 0)
-    az = pz + (0 if facing_x else arm_len * 0.5)
-    o = mkbox("tlarm", ax, 5.5, az,
-              arm_len if facing_x else 0.12,
-              0.12,
-              0.12 if facing_x else arm_len)
-    asgn("pole_m", o); objs.append(o)
-    # Housing box
-    hx = px + (arm_len if facing_x else 0)
-    hz = pz + (0 if facing_x else arm_len)
-    o = mkbox("tlbox", hx, 4.4, hz, 0.35, 1.2, 0.35)
-    asgn("drk_mat", o); objs.append(o)
-    # Three signal lights (red / yellow / green top to bottom)
-    for k, (lmat, ly_off) in enumerate([("lt_red",  5.7),
-                                         ("lt_yel",  5.3),
-                                         ("lt_grn",  4.9)]):
-        o = mkcyl("ltlight", hx, ly_off, hz, 0.12, 0.12)
-        asgn(lmat, o); objs.append(o)
-    return collapse_meshes(objs, "tl_asset")
-
-
-for col in range(N + 1):
+def place_street_furniture(sidewalk_h):
+    spacing = 14.0
+    for col in range(N + 1):
+        cx = road_cx(col)
+        for side in (-1, 1):
+            sx = cx + side * (ROAD_W * 0.5 + SW_W * 0.5)
+            z = OZ + 5.0
+            idx = 0
+            while z < OZ + CITY_SZ - 5.0:
+                asset = "lamp" if idx % 3 == 0 else ("bench" if idx % 3 == 1 else "trash")
+                ry = 90 if asset == "bench" else 0
+                instance_proto(asset, sx, sidewalk_h, z, ry=ry, parent_group="Grp_StreetFurniture")
+                idx += 1
+                z += spacing
     for row in range(N + 1):
-        ix, iz = road_cx(col), road_cz(row)
-        offset = ROAD_W * 0.5 + SW_W * 0.5
-        # Four poles, one at each quadrant of the intersection
-        corners = [
-            (ix - offset, iz - offset, True),
-            (ix + offset, iz - offset, True),
-            (ix - offset, iz + offset, False),
-            (ix + offset, iz + offset, False),
-        ]
-        for px, pz, fx in corners:
-            tl_objs.extend(make_traffic_light(px, pz, fx))
-
-put(tl_objs, "Grp_TrafficLights")
-print("  Traffic light objects: {}".format(len(tl_objs)))
+        cz = road_cz(row)
+        for side in (-1, 1):
+            sz = cz + side * (ROAD_W * 0.5 + SW_W * 0.5)
+            x = OX + 5.0
+            idx = 0
+            while x < OX + CITY_SZ - 5.0:
+                asset = "lamp" if idx % 3 == 0 else ("bench" if idx % 3 == 1 else "trash")
+                ry = 0
+                instance_proto(asset, x, sidewalk_h, sz, ry=ry, parent_group="Grp_StreetFurniture")
+                idx += 1
+                x += spacing
 
 
-# =============================================================================
-# SECTION 8: BILLBOARDS  (30 along major roads)
-# =============================================================================
-print("Section 8: Billboards...")
-bb_objs = []
+def place_cars(sidewalk_h):
+    n_cars = random.randint(150, 200)
+    car_assets = ["car_r", "car_b", "car_s", "car_k", "car_w"]
+    for _ in range(n_cars):
+        lane = random.choice(["parked_v", "parked_h", "driving_v", "driving_h"])
+        if lane == "parked_v":
+            col = random.randint(0, N)
+            cx = road_cx(col) + random.choice([-1, 1]) * ROAD_W * 0.32
+            cz = OZ + random.uniform(0.02, 0.98) * CITY_SZ
+            ry = 0
+        elif lane == "parked_h":
+            row = random.randint(0, N)
+            cz = road_cz(row) + random.choice([-1, 1]) * ROAD_W * 0.32
+            cx = OX + random.uniform(0.02, 0.98) * CITY_SZ
+            ry = 90
+        elif lane == "driving_v":
+            col = random.randint(0, N)
+            cx = road_cx(col)
+            cz = OZ + random.uniform(0.02, 0.98) * CITY_SZ
+            ry = 0
+        else:
+            row = random.randint(0, N)
+            cz = road_cz(row)
+            cx = OX + random.uniform(0.02, 0.98) * CITY_SZ
+            ry = 90
+        instance_proto(random.choice(car_assets), cx, sidewalk_h, cz, ry=ry, parent_group="Grp_Cars")
 
 
-def make_billboard(cx, by, cz, ry=0):
-    """Double-sided billboard with two metal support legs."""
+def make_storefronts(sidewalk_h):
     objs = []
-    bh, bw, bd = 4.0, 8.0, 0.3
-    leg_h = by + 1.0
-    # Left leg
-    o = mkcyl("bleg", cx - bw * 0.35, 0, cz, 0.18, leg_h + bh * 0.5)
-    asgn("bill_sp", o); objs.append(o)
-    # Right leg
-    o = mkcyl("bleg", cx + bw * 0.35, 0, cz, 0.18, leg_h + bh * 0.5)
-    asgn("bill_sp", o); objs.append(o)
-    # Face (front)
-    mat = random.choice(BILL_MATS)
-    o = mkbox("bface", cx, leg_h, cz - bd * 0.5, bw, bh, bd * 0.5, ry=ry)
-    asgn(mat, o); objs.append(o)
-    # Face (back, different colour)
-    mat2 = random.choice(BILL_MATS)
-    o = mkbox("bface", cx, leg_h, cz + bd * 0.5, bw, bh, bd * 0.5, ry=ry)
-    asgn(mat2, o); objs.append(o)
-    return collapse_meshes(objs, "billboard")
+    sample = list(_entrances)
+    random.shuffle(sample)
+    sample = sample[:max(1, int(len(sample) * 0.30))]
+
+    for cx, _cz, fz, bw in sample:
+        st = random.choice(["coffee", "restaurant", "barbershop", "club"])
+        if st == "coffee":
+            t = mkbox("ctable", cx, sidewalk_h, fz - 2.0, 1.0, 0.7, 1.0)
+            c1 = mkbox("cchair", cx - 0.6, sidewalk_h, fz - 2.0, 0.45, 0.5, 0.45)
+            c2 = mkbox("cchair", cx + 0.6, sidewalk_h, fz - 2.0, 0.45, 0.5, 0.45)
+            s = mkbox("csign", cx, 2.6, fz - 0.15, min(bw * 0.6, 3.0), 0.6, 0.1)
+            assign("bench", t)
+            assign("bench", c1)
+            assign("bench", c2)
+            assign("sign", s)
+            objs.extend([t, c1, c2, s])
+        elif st == "restaurant":
+            a = mkbox("rawn", cx, 2.5, fz - 1.2, min(bw * 0.8, 5.0), 0.25, 2.2)
+            m = mkbox("menu", cx - bw * 0.3, sidewalk_h, fz - 2.0, 0.08, 1.4, 0.9)
+            p = mkbox("planter", cx + bw * 0.25, sidewalk_h, fz - 2.0, 0.8, 0.5, 0.8)
+            assign("awning_r", a)
+            assign("dark", m)
+            assign("planter", p)
+            objs.extend([a, m, p])
+        elif st == "barbershop":
+            for k, bmat in enumerate(["barber_r", "barber_w", "barber_b", "barber_r", "barber_w"]):
+                pole = mkcyl("bpole", cx - bw * 0.4, sidewalk_h + k * 0.5, fz - 0.25, 0.1, 0.5, sx=6)
+                assign(bmat, pole)
+                objs.append(pole)
+            s = mkbox("bsign", cx, 2.6, fz - 0.15, min(bw * 0.55, 2.5), 0.55, 0.1)
+            assign("sign", s)
+            objs.append(s)
+        else:
+            for ky in (0.8, 1.6, 2.4):
+                led = mkbox("led", cx, ky, fz - 0.05, min(bw * 0.9, 6.0), 0.12, 0.06)
+                assign("bill_m", led)
+                objs.append(led)
+            p1 = mkcyl("qpost", cx - 1.5, sidewalk_h, fz - 2.5, 0.07, 1.0, sx=6)
+            p2 = mkcyl("qpost", cx + 1.5, sidewalk_h, fz - 2.5, 0.07, 1.0, sx=6)
+            r = mkbox("rope", cx, sidewalk_h + 1.0, fz - 2.5, 3.0, 0.06, 0.06)
+            assign("metal", p1)
+            assign("metal", p2)
+            assign("rope", r)
+            objs.extend([p1, p2, r])
+
+    put(objs, "Grp_Storefronts")
 
 
-# Scatter 30 billboards along roads (sidewalk edge)
-for _ in range(30):
-    col  = random.randint(0, N)
-    side = random.choice([-1, 1])
-    cx_r = road_cx(col) + side * (ROAD_W * 0.5 + SW_W + 0.5)
-    z_r  = OZ + random.uniform(0.05, 0.95) * CITY_SZ
-    bb_objs.extend(make_billboard(cx_r, SWH, z_r, ry=0))
-
-put(bb_objs, "Grp_Billboards")
-print("  Billboard objects: {}".format(len(bb_objs)))
-
-
-# =============================================================================
-# SECTION 9: TREES  (15–20 per block along sidewalks)
-# =============================================================================
-print("Section 9: Trees...")
-tree_objs = []
-
-
-def make_tree(cx, cz):
-    """Simple stylized tree: brown trunk + 2-3 green foliage spheres."""
+def place_cranes(sidewalk_h):
+    # Simplified cranes: exactly 3 cylinders + 2 boxes
     objs = []
-    th = random.uniform(2.5, 4.5)
-    tr = random.uniform(0.18, 0.30)
-    # Trunk
-    o = mkcyl("trunk", cx, SWH, cz, tr, th)
-    asgn("trunk_c", o); objs.append(o)
-    # Foliage (2–3 spheres stacked/offset)
-    n_sph = random.randint(2, 3)
-    for k in range(n_sph):
-        fr = random.uniform(0.9, 1.6)
-        fy = SWH + th + k * fr * 0.55
-        fx = cx + random.uniform(-0.3, 0.3)
-        fz = cz + random.uniform(-0.3, 0.3)
-        fmat = "foliage" if k % 2 == 0 else "foliage2"
-        o = mksph("foliage", fx, fy, fz, fr)
-        asgn(fmat, o); objs.append(o)
-    return collapse_meshes(objs, "tree")
+    positions = random.sample([(bi, bj) for bi in range(1, N - 1) for bj in range(1, N - 1)], 8)
+    for bi, bj in positions:
+        cx = blk_cx(bi) + random.uniform(-8, 8)
+        cz = blk_cz(bj) + random.uniform(-8, 8)
+        h = random.uniform(32, 48)
+        jib = random.uniform(14, 20)
+
+        tower = mkcyl("cr_tower", cx, 0, cz, 0.30, h, sx=6)
+        cable = mkcyl("cr_cable", cx + jib * 0.62, sidewalk_h, cz, 0.05, h + 1.8 - sidewalk_h, sx=6)
+        hook = mkcyl("cr_hook", cx + jib * 0.62, sidewalk_h, cz, 0.12, 0.5, sx=6)
+        boom = mkbox("cr_boom", cx + jib * 0.5, h + 1.8, cz, jib, 0.45, 0.45)
+        cab = mkbox("cr_cab", cx, h, cz, 2.2, 1.8, 1.8)
+
+        assign("crane_y", tower)
+        assign("cable", cable)
+        assign("crane_dark", hook)
+        assign("crane_y", boom)
+        assign("crane_dark", cab)
+        objs.extend([tower, cable, hook, boom, cab])
+
+    put(objs, "Grp_Cranes")
 
 
-for bi in range(N):
-    for bj in range(N):
-        n_trees = random.randint(15, 20)
-        ox = blk_ox(bi)
-        oz = blk_oz(bj)
-
-        for _ in range(n_trees):
-            edge = random.randint(0, 3)
-            if edge == 0:   # South side
-                tx = ox + random.uniform(2, BLOCK_SIZE - 2)
-                tz = oz - SW_W * 0.5
-            elif edge == 1: # North side
-                tx = ox + random.uniform(2, BLOCK_SIZE - 2)
-                tz = oz + BLOCK_SIZE + SW_W * 0.5
-            elif edge == 2: # West side
-                tx = ox - SW_W * 0.5
-                tz = oz + random.uniform(2, BLOCK_SIZE - 2)
-            else:           # East side
-                tx = ox + BLOCK_SIZE + SW_W * 0.5
-                tz = oz + random.uniform(2, BLOCK_SIZE - 2)
-            tree_objs.extend(make_tree(tx, tz))
-
-put(tree_objs, "Grp_Trees")
-print("  Tree objects: {}".format(len(tree_objs)))
-
-
-# =============================================================================
-# SECTION 10: STREET FURNITURE  (benches, trash cans, lamp posts)
-# =============================================================================
-print("Section 10: Street furniture...")
-furn_objs = []
-
-
-def make_bench(cx, cz, ry=0):
-    """Simple park bench: seat + back + two legs."""
+def place_misc(sidewalk_h):
     objs = []
-    LEG_H = 0.35   # legs lift seat above sidewalk surface
-    # Legs (rest on sidewalk surface)
-    for lx in (-0.8, 0.8):
-        o = mkbox("bleg", cx + lx, SWH, cz, 0.1, LEG_H, 0.55, ry=ry)
-        asgn("metal", o); objs.append(o)
-    # Seat (on top of legs)
-    o = mkbox("bseat", cx, SWH + LEG_H, cz, 2.0, 0.12, 0.6, ry=ry)
-    asgn("bench_m", o); objs.append(o)
-    # Back rest
-    o = mkbox("bback", cx, SWH + LEG_H + 0.17, cz + 0.24, 2.0, 0.45, 0.08, ry=ry)
-    asgn("bench_m", o); objs.append(o)
-    return collapse_meshes(objs, "bench")
 
+    # Manholes / hydrants / dumpsters
+    for bi in range(N):
+        for bj in range(N):
+            ox = blk_ox(bi)
+            oz = blk_oz(bj)
+            for _ in range(random.randint(1, 2)):
+                mh = mkcyl("mhole", ox + random.uniform(0, BLOCK_SIZE), sidewalk_h - 0.01, oz - SW_W * 0.3, 0.45, 0.04, sx=6)
+                assign("manhole", mh)
+                objs.append(mh)
+            hx = ox + random.uniform(2, BLOCK_SIZE - 2)
+            hz = oz - SW_W * 0.5
+            hb = mkcyl("hydr", hx, sidewalk_h, hz, 0.18, 0.7, sx=6)
+            hc = mksph("hydr_cap", hx, sidewalk_h + 0.7, hz, 0.2, sx=6, sy=4)
+            assign("hydrant", hb)
+            assign("hydrant", hc)
+            objs.extend([hb, hc])
+            if (bi + bj) % 4 == 0:
+                dx = ox + random.uniform(4, BLOCK_SIZE - 4)
+                dz = oz + BLOCK_SIZE * 0.85
+                dp = mkbox("dump", dx, sidewalk_h, dz, 2.4, 1.1, 1.1, ry=random.choice([0, 90]))
+                rim = mkbox("dump_rim", dx, sidewalk_h + 1.1, dz, 2.5, 0.08, 1.2)
+                assign("dumpster", dp)
+                assign("dark", rim)
+                objs.extend([dp, rim])
 
-def make_trash_can(cx, cz):
-    """Cylindrical trash can."""
-    objs = []
-    o = mkcyl("trash", cx, SWH, cz, 0.25, 0.9)
-    asgn("trash_m", o); objs.append(o)
-    # Lid ring
-    o = mkcyl("lid", cx, SWH + 0.9, cz, 0.27, 0.06)
-    asgn("drk_mat", o); objs.append(o)
-    return collapse_meshes(objs, "trashcan")
-
-
-def make_lamp_post(cx, cz):
-    """Street lamp: pole + glowing spherical cap."""
-    objs = []
-    # Pole
-    o = mkcyl("lamppole", cx, SWH, cz, 0.08, 6.5)
-    asgn("lamp_m", o); objs.append(o)
-    # Horizontal arm
-    o = mkbox("lamparm", cx + 0.4, SWH + 6.5, cz, 0.8, 0.08, 0.08)
-    asgn("lamp_m", o); objs.append(o)
-    # Glowing cap (sphere)
-    o = mksph("lampgl", cx + 0.8, SWH + 6.5, cz, 0.25)
-    asgn("lamp_gl", o); objs.append(o)
-    return collapse_meshes(objs, "lamppost")
-
-
-# Place furniture at regular intervals along sidewalks
-FURN_SPACING = 12.0
-for col in range(N + 1):
-    cx = road_cx(col)
-    for side in (-1, 1):
-        sx = cx + side * (ROAD_W * 0.5 + SW_W * 0.5)
-        z  = OZ + 5.0
-        idx = 0
+    # Power poles
+    for col in range(N + 1):
+        cx = road_cx(col) + ROAD_W * 0.5 + SW_W
+        z = OZ + 5.0
         while z < OZ + CITY_SZ - 5.0:
-            if idx % 3 == 0:
-                furn_objs.extend(make_lamp_post(sx, z))
-            elif idx % 3 == 1:
-                furn_objs.extend(make_bench(sx, z, ry=90))
-            else:
-                furn_objs.extend(make_trash_can(sx, z))
-            idx += 1
-            z += FURN_SPACING
+            p = mkcyl("ppole", cx, 0, z, 0.12, 8.8, sx=6)
+            b = mkbox("pbar", cx, 8.6, z, 3.2, 0.14, 0.14)
+            assign("wood", p)
+            assign("wood", b)
+            objs.extend([p, b])
+            z += 22.0
 
-for row in range(N + 1):
-    cz = road_cz(row)
-    for side in (-1, 1):
-        sz = cz + side * (ROAD_W * 0.5 + SW_W * 0.5)
-        x  = OX + 5.0
-        idx = 0
-        while x < OX + CITY_SZ - 5.0:
-            if idx % 3 == 0:
-                furn_objs.extend(make_lamp_post(x, sz))
-            elif idx % 3 == 1:
-                furn_objs.extend(make_bench(x, sz))
-            else:
-                furn_objs.extend(make_trash_can(x, sz))
-            idx += 1
-            x += FURN_SPACING
-
-put(furn_objs, "Grp_StreetFurniture")
-print("  Furniture objects: {}".format(len(furn_objs)))
+    put(objs, "Grp_MiscDetails")
 
 
-# =============================================================================
-# SECTION 11: CARS  (150–200 parked & driving)
-# =============================================================================
-print("Section 11: Cars...")
-car_objs = []
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
+def generate_city():
+    print("Starting optimized procedural city generation...")
+    print("  QUALITY: {}".format(QUALITY))
+    print("  Grid: {}x{} | Buildings per block: {}".format(N, N, BUILDINGS_PER_BLOCK))
+
+    # Force clean scene and suspend viewport updates for performance.
+    # NOTE: This intentionally clears any unsaved scene content.
+    cmds.file(newFile=True, force=True)
+    cmds.refresh(suspend=True)
+
+    completed = False
+    try:
+        cmds.group(em=True, name=MASTER)
+        create_materials()
+        create_prototypes()
+
+        sidewalk_h = build_ground_roads_sidewalks_markings()
+        periodic_cleanup("roads/markings")
+        progress(20, "roads, sidewalks, and road markings complete")
+
+        build_buildings()
+        periodic_cleanup("buildings")
+        progress(40, "buildings complete")
+
+        place_traffic_lights()
+        place_billboards()
+        place_trees(sidewalk_h)
+        periodic_cleanup("traffic lights/billboards/trees")
+        progress(60, "traffic lights, billboards, and trees complete")
+
+        place_street_furniture(sidewalk_h)
+        place_cars(sidewalk_h)
+        make_storefronts(sidewalk_h)
+        periodic_cleanup("furniture/cars/storefronts")
+        progress(80, "street furniture, cars, and storefronts complete")
+
+        place_cranes(sidewalk_h)
+        place_misc(sidewalk_h)
+        periodic_cleanup("cranes/misc details")
+        progress(100, "city generation complete")
+
+        total_children = 0
+        for g in _groups.values():
+            total_children += len(cmds.listRelatives(g, children=True) or [])
+
+        print("\n=== Procedural City Generation Complete ===")
+        print("Master group : {}".format(MASTER))
+        print("Sub-groups   : {}".format(len(_groups)))
+        print("Scene children under sub-groups: {}".format(total_children))
+        print("Buildings    : {}".format(N * N * BUILDINGS_PER_BLOCK))
+        print("Random seed  : 42")
+        print("===========================================\n")
+        completed = True
+
+    finally:
+        cmds.refresh(suspend=False)
+        cmds.refresh(force=True)
+        if not completed:
+            print("City generation was interrupted; viewport refresh has been restored.")
 
 
-def make_car(cx, cz, ry=0, paint=None):
-    """Box-body car with rounded top, 4 wheels and window panels."""
-    objs = []
-    if paint is None:
-        paint = random.choice(CAR_MATS)
-    # Body
-    o = mkbox("carbody", cx, SWH, cz, 3.8, 1.0, 1.8, ry=ry)
-    asgn(paint, o); objs.append(o)
-    # Roof (slightly narrower/shorter, centred higher)
-    o = mkbox("carroof", cx, SWH + 1.0, cz, 2.2, 0.75, 1.6, ry=ry)
-    asgn(paint, o); objs.append(o)
-    # Front & rear windshields (thin blue panels)
-    for wz_off in (-1.4, 1.4):
-        o = mkbox("carwin", cx, SWH + 1.25, cz + wz_off, 1.8, 0.6, 0.08, ry=ry)
-        asgn("car_win", o); objs.append(o)
-    # Four wheels (cylinders lying on their side; rz_=90 makes disk face outward).
-    # We need the wheel centre to sit at y = WHEEL_R above the ground so the
-    # bottom of the tire (y=0) just touches the road surface.
-    # mkcyl places the object centre at  by + h/2,  so:
-    #   wheel_centre_y = wheel_by + WHEEL_T / 2  = WHEEL_R
-    #   => wheel_by = WHEEL_R - WHEEL_T / 2
-    WHEEL_R, WHEEL_T = 0.28, 0.22
-    wheel_by = WHEEL_R - WHEEL_T * 0.5   # = 0.17 (bottom of lying cylinder)
-    for wx_off in (-1.3, 1.3):
-        for wz_off2 in (-0.75, 0.75):
-            o = mkcyl("wheel",
-                      cx + wx_off, wheel_by, cz + wz_off2,
-                      WHEEL_R, WHEEL_T, rz_=90)
-            asgn("tire_c", o); objs.append(o)
-    return collapse_meshes(objs, "car")
-
-
-# Scatter cars: parked along road edges and a few "driving" mid-lane
-n_cars = random.randint(150, 200)
-for _ in range(n_cars):
-    lane = random.choice(["parked_v", "parked_h", "driving_v", "driving_h"])
-    if lane == "parked_v":
-        col   = random.randint(0, N)
-        cx    = road_cx(col) + random.choice([-1, 1]) * ROAD_W * 0.32
-        cz    = OZ + random.uniform(0.02, 0.98) * CITY_SZ
-        ry    = 0
-    elif lane == "parked_h":
-        row   = random.randint(0, N)
-        cz    = road_cz(row) + random.choice([-1, 1]) * ROAD_W * 0.32
-        cx    = OX + random.uniform(0.02, 0.98) * CITY_SZ
-        ry    = 90
-    elif lane == "driving_v":
-        col   = random.randint(0, N)
-        cx    = road_cx(col)
-        cz    = OZ + random.uniform(0.02, 0.98) * CITY_SZ
-        ry    = 0
-    else:
-        row   = random.randint(0, N)
-        cz    = road_cz(row)
-        cx    = OX + random.uniform(0.02, 0.98) * CITY_SZ
-        ry    = 90
-    car_objs.extend(make_car(cx, cz, ry=ry))
-
-put(car_objs, "Grp_Cars")
-print("  Car objects: {}".format(len(car_objs)))
-
-
-# =============================================================================
-# SECTION 12: COMMERCIAL STOREFRONTS  (30 % of buildings)
-# =============================================================================
-print("Section 12: Commercial storefronts...")
-store_objs = []
-
-# Pick 30 % of recorded entrances
-random.shuffle(_entrances)
-n_stores = max(1, int(len(_entrances) * 0.30))
-store_sample = _entrances[:n_stores]
-
-store_types = ["coffee", "restaurant", "barbershop", "club"]
-
-
-def make_coffee_shop(cx, fz, w):
-    """Outdoor table + 2 chairs + sign."""
-    objs = []
-    # Table
-    o = mkbox("ctable", cx, SWH, fz - 2.0, 1.0, 0.7, 1.0)
-    asgn("bench_m", o); objs.append(o)
-    # Two chairs
-    for lx in (-0.6, 0.6):
-        o = mkbox("cchair", cx + lx, SWH, fz - 2.0, 0.5, 0.5, 0.5)
-        asgn("bench_m", o); objs.append(o)
-    # Coffee sign panel
-    o = mkbox("csign", cx, 2.6, fz - 0.15, min(w * 0.6, 3.0), 0.6, 0.1)
-    asgn("sign_m", o); objs.append(o)
-    return collapse_meshes(objs, "shop_coffee")
-
-
-def make_restaurant(cx, fz, w):
-    """Red awning, menu board, outdoor planter."""
-    objs = []
-    # Red awning
-    o = mkbox("rawn", cx, 2.5, fz - 1.2, min(w * 0.8, 5.0), 0.25, 2.4)
-    asgn("awning_r", o); objs.append(o)
-    # Menu board (thin flat rectangle)
-    o = mkbox("menu", cx - w * 0.3, SWH, fz - 2.0, 0.08, 1.4, 0.9)
-    asgn("drk_mat", o); objs.append(o)
-    # Planter (green box)
-    o = mkbox("plntr", cx + w * 0.25, SWH, fz - 2.0, 0.8, 0.5, 0.8)
-    asgn("planter_m", o); objs.append(o)
-    return collapse_meshes(objs, "shop_rest")
-
-
-def make_barbershop(cx, fz, w):
-    """Barber pole (striped cylinder) + small sign."""
-    objs = []
-    # Barber pole — single cylinder; colour it red/white alternating
-    # (3-colour stripe represented via 3 stacked short cylinders)
-    pole_r = 0.1
-    for k, bmat in enumerate(["barber_r", "barber_w", "barber_b",
-                               "barber_r", "barber_w"]):
-        o = mkcyl("bpole", cx - w * 0.4, SWH + k * 0.5, fz - 0.25, pole_r, 0.5)
-        asgn(bmat, o); objs.append(o)
-    # Sign
-    o = mkbox("bsign", cx, 2.6, fz - 0.15, min(w * 0.55, 2.5), 0.55, 0.1)
-    asgn("sign_m", o); objs.append(o)
-    return collapse_meshes(objs, "shop_barber")
-
-
-def make_club(cx, fz, w):
-    """LED stripe bands on facade + queue barrier (2 posts + rope)."""
-    objs = []
-    # LED bands — three thin horizontal bars on facade
-    for ky in (0.8, 1.6, 2.4):
-        o = mkbox("led", cx, ky, fz - 0.05, min(w * 0.9, 6.0), 0.12, 0.06)
-        asgn("bill_m", o); objs.append(o)
-    # Queue barrier posts
-    for lx in (-1.5, 1.5):
-        o = mkcyl("qpost", cx + lx, SWH, fz - 2.5, 0.07, 1.0)
-        asgn("metal", o); objs.append(o)
-    # Rope between posts
-    o = mkbox("rope", cx, SWH + 1.0, fz - 2.5, 3.0, 0.06, 0.06)
-    asgn("rope_m", o); objs.append(o)
-    return collapse_meshes(objs, "shop_club")
-
-
-STORE_FN = {
-    "coffee":      make_coffee_shop,
-    "restaurant":  make_restaurant,
-    "barbershop":  make_barbershop,
-    "club":        make_club,
-}
-
-for (cx, cz, fz, bw) in store_sample:
-    stype = random.choice(store_types)
-    store_objs.extend(STORE_FN[stype](cx, fz, bw))
-
-put(store_objs, "Grp_Storefronts")
-print("  Storefront objects: {}".format(len(store_objs)))
-
-
-# =============================================================================
-# SECTION 13: CRANES  (8 construction cranes)
-# =============================================================================
-print("Section 13: Cranes...")
-crane_objs = []
-
-
-def make_crane(cx, cz, h=40.0, jib_len=18.0):
-    """Tower crane: lattice tower, horizontal jib, cab, and hook cable."""
-    objs = []
-    # Tower (main vertical column, hollow lattice simulated by 4 corner rods)
-    col_r = 0.25
-    col_sp = 1.0
-    for dx, dz in [(-col_sp, -col_sp), (col_sp, -col_sp),
-                   (-col_sp,  col_sp), (col_sp,  col_sp)]:
-        o = mkcyl("ctwr", cx + dx, 0, cz + dz, col_r, h)
-        asgn("crane_y", o); objs.append(o)
-    # Cross-braces every 4 units up the tower
-    for ky in range(0, int(h), 4):
-        o = mkbox("cbrace", cx, ky + 2, cz, col_sp * 2 + 0.5, 0.15, 0.15)
-        asgn("crane_y", o); objs.append(o)
-        o = mkbox("cbrace", cx, ky + 2, cz, 0.15, 0.15, col_sp * 2 + 0.5)
-        asgn("crane_y", o); objs.append(o)
-    # Cab (operator's cabin on top of tower)
-    o = mkbox("ccab", cx, h, cz, 2.5, 2.2, 2.5)
-    asgn("crane_k", o); objs.append(o)
-    # Cab window
-    o = mkbox("ccabwin", cx, h + 1.0, cz - 1.3, 1.8, 1.0, 0.1)
-    asgn("glass", o); objs.append(o)
-    # Horizontal jib (main boom)
-    jib_cx = cx + jib_len * 0.5
-    o = mkbox("cjib", jib_cx, h + 2.2, cz, jib_len, 0.5, 0.5)
-    asgn("crane_y", o); objs.append(o)
-    # Counter-jib (shorter, opposite side)
-    cj_len = jib_len * 0.38
-    cj_cx  = cx - cj_len * 0.5
-    o = mkbox("ccjib", cj_cx, h + 2.2, cz, cj_len, 0.4, 0.4)
-    asgn("crane_y", o); objs.append(o)
-    # Counterweight
-    o = mkbox("ccwt", cx - cj_len, h + 2.2, cz, 2.0, 1.2, 1.5)
-    asgn("concrete", o); objs.append(o)
-    # Trolley on jib
-    tr_x = cx + jib_len * 0.65
-    o = mkbox("ctrlly", tr_x, h + 2.2, cz, 0.8, 0.5, 0.8)
-    asgn("crane_k", o); objs.append(o)
-    # Hook cable
-    o = mkcyl("ccable", tr_x, SWH, cz, 0.04, h + 2.2 - SWH)
-    asgn("cable_m", o); objs.append(o)
-    # Hook
-    o = mkbox("chook", tr_x, SWH, cz, 0.3, 0.5, 0.3)
-    asgn("metal", o); objs.append(o)
-    return collapse_meshes(objs, "crane")
-
-
-# Place 8 cranes at scattered block positions
-crane_positions = random.sample(
-    [(bi, bj) for bi in range(1, N - 1) for bj in range(1, N - 1)], 8
-)
-for bi, bj in crane_positions:
-    cx = blk_cx(bi) + random.uniform(-8, 8)
-    cz = blk_cz(bj) + random.uniform(-8, 8)
-    crane_h   = random.uniform(35, 55)
-    crane_jib = random.uniform(15, 22)
-    crane_objs.extend(make_crane(cx, cz, crane_h, crane_jib))
-
-put(crane_objs, "Grp_Cranes")
-print("  Crane objects: {}".format(len(crane_objs)))
-
-
-# =============================================================================
-# SECTION 14: MISC DETAILS
-#   Manhole covers, fire hydrants, dumpsters, power/telephone poles
-# =============================================================================
-print("Section 14: Misc details...")
-misc_objs = []
-
-
-def make_manhole(cx, cz):
-    """Flat black circle (manhole cover) on sidewalk."""
-    o = mkcyl("mhole", cx, SWH - 0.01, cz, 0.45, 0.04)
-    asgn("manhole_m", o)
-    return [o]
-
-
-def make_hydrant(cx, cz):
-    """Red fire hydrant: body + two side nubs."""
-    objs = []
-    o = mkcyl("hyd_b", cx, SWH, cz, 0.18, 0.7)
-    asgn("hydrant_m", o); objs.append(o)
-    # Cap dome
-    o = mksph("hyd_cap", cx, SWH + 0.7, cz, 0.20)
-    asgn("hydrant_m", o); objs.append(o)
-    # Side nubs
-    for side in (-1, 1):
-        o = mkcyl("hyd_n", cx + side * 0.22, SWH + 0.3, cz, 0.07, 0.2, rz_=90)
-        asgn("hydrant_m", o); objs.append(o)
-    return collapse_meshes(objs, "hydrant")
-
-
-def make_dumpster(cx, cz, ry=0):
-    """Green open-top dumpster box."""
-    objs = []
-    # Body
-    o = mkbox("dump", cx, SWH, cz, 2.5, 1.2, 1.2, ry=ry)
-    asgn("dumpster_m", o); objs.append(o)
-    # Open interior (just show rim — thin top frame)
-    o = mkbox("dumplid", cx, SWH + 1.2, cz, 2.6, 0.1, 1.3, ry=ry)
-    asgn("drk_mat", o); objs.append(o)
-    return collapse_meshes(objs, "dumpster")
-
-
-def make_power_pole(cx, cz):
-    """Wooden power/telephone pole with crossbar and wires."""
-    objs = []
-    # Post
-    o = mkcyl("ppole", cx, 0, cz, 0.12, 9.0)
-    asgn("wood_m", o); objs.append(o)
-    # Crossbar
-    o = mkbox("pbar", cx, 8.8, cz, 3.5, 0.15, 0.15)
-    asgn("wood_m", o); objs.append(o)
-    # Insulators (small cylinders on bar ends)
-    for lx in (-1.6, 1.6):
-        o = mkcyl("pins", cx + lx, 8.95, cz, 0.06, 0.2)
-        asgn("wht_mat", o); objs.append(o)
-    return collapse_meshes(objs, "powerpole")
-
-
-# Scatter misc details across sidewalks
-for bi in range(N):
-    for bj in range(N):
-        ox = blk_ox(bi)
-        oz = blk_oz(bj)
-        # Manhole covers on sidewalks (1–2 per block)
-        for _ in range(random.randint(1, 2)):
-            tx = ox + random.uniform(0, BLOCK_SIZE)
-            tz = oz - SW_W * 0.3
-            misc_objs.extend(make_manhole(tx, tz))
-        # Fire hydrants (1 per block)
-        hx = ox + random.uniform(2, BLOCK_SIZE - 2)
-        hz = oz - SW_W * 0.5
-        misc_objs.extend(make_hydrant(hx, hz))
-        # Dumpster in back alley (every 4th block)
-        if (bi + bj) % 4 == 0:
-            dx = ox + random.uniform(4, BLOCK_SIZE - 4)
-            dz = oz + BLOCK_SIZE * 0.85
-            misc_objs.extend(make_dumpster(dx, dz, ry=random.choice([0, 90])))
-
-# Power poles along sidewalks (every 20 units along vertical roads)
-PP_SPACING = 20.0
-for col in range(N + 1):
-    cx = road_cx(col) + ROAD_W * 0.5 + SW_W
-    z  = OZ + 5.0
-    while z < OZ + CITY_SZ - 5.0:
-        misc_objs.extend(make_power_pole(cx, z))
-        z += PP_SPACING
-
-put(misc_objs, "Grp_MiscDetails")
-print("  Misc-detail objects: {}".format(len(misc_objs)))
-
-
-# =============================================================================
-# DONE — report totals
-# =============================================================================
-total_grp_children = 0
-for gn, g in _grps.items():
-    kids = cmds.listRelatives(g, children=True) or []
-    total_grp_children += len(kids)
-
-print("\n=== Procedural City Generation Complete ===")
-print("Master group : {}".format(MASTER))
-print("Sub-groups   : {}".format(len(_grps)))
-print("Total objects in sub-groups: {}".format(total_grp_children))
-print("Random seed  : 42")
-print("Grid         : {}x{} blocks ({} units wide)".format(N, N, CITY_SZ))
-print("===========================================\n")
+generate_city()
