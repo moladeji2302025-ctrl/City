@@ -4,7 +4,8 @@ procedural_city.py
 Optimized Maya procedural city generator.
 
 Performance optimizations implemented:
-- 12x12 grid with higher in-block density (~2,500+ buildings total)
+- Reduced master city size presets via CITY_SIZE ("small"/"tiny"/"test")
+- 5x5 default grid (down from the larger 12x12 variant)
 - Asset instancing for repeated objects (windows, trees, cars, traffic lights,
   and street furniture)
 - Lower-poly repeated assets (trees, cars, roof details, crane)
@@ -31,22 +32,44 @@ import maya.cmds as cmds
 # -----------------------------------------------------------------------------
 random.seed(42)
 QUALITY = "medium"  # "medium" or "low"
+CITY_SIZE = "small"  # "small"=5x5, "tiny"=3x3, "test"=2x2
 
 BLOCK_SIZE = 50
 ROAD_W = 8
 SW_W = 2
 STREET_MOD = ROAD_W + SW_W * 2
 MODULE = BLOCK_SIZE + STREET_MOD
-N = 12  # reduced from 20 for better viewport/memory reliability; density increased below
+
+# Changed from the previous larger-grid version:
+# use a master size preset so city footprint and dependent counts scale together.
+_CITY_SIZE_PRESETS = {"small": 5, "tiny": 3, "test": 2}
+N = _CITY_SIZE_PRESETS.get(CITY_SIZE.lower(), _CITY_SIZE_PRESETS["small"])
 CITY_SZ = N * MODULE + STREET_MOD
 OX = -CITY_SZ / 2.0
 OZ = -CITY_SZ / 2.0
 MASTER = "Procedural_City"
 
-# 6x6 placement grid per block with 18 buildings/block => 2592 buildings total
+# Changed from the larger version:
+# lower in-block density while preserving style/entrance/window/roof systems.
 SUBDIV = 6
 CELL_SZ = BLOCK_SIZE / float(SUBDIV)
-BUILDINGS_PER_BLOCK = 18
+BUILDINGS_PER_BLOCK_MIN = 6
+BUILDINGS_PER_BLOCK_MAX = 10
+TREES_PER_BLOCK_MIN = 8
+TREES_PER_BLOCK_MAX = 12
+
+# Related counts scale with CITY_SIZE footprint (5x5 baseline == 1.0).
+# For CITY_SIZE="small" this yields:
+# - billboards: 10-15 (was 30 in the larger 12x12 version)
+# - cars: 50-75 (was 150-200)
+# - cranes: 3-4 (was 8)
+_CITY_SCALE = float(N * N) / 25.0  # 25.0 = 5x5 baseline grid area
+BILLBOARD_COUNT_MIN = max(2, int(round(10 * _CITY_SCALE)))
+BILLBOARD_COUNT_MAX = max(BILLBOARD_COUNT_MIN, int(round(15 * _CITY_SCALE)))
+CAR_COUNT_MIN = max(8, int(round(50 * _CITY_SCALE)))
+CAR_COUNT_MAX = max(CAR_COUNT_MIN, int(round(75 * _CITY_SCALE)))
+CRANE_COUNT_MIN = max(1, int(round(3 * _CITY_SCALE)))
+CRANE_COUNT_MAX = max(CRANE_COUNT_MIN, int(round(4 * _CITY_SCALE)))
 
 # Window/roof complexity switches for QUALITY
 LOW_QUALITY = QUALITY.lower() == "low"
@@ -584,7 +607,9 @@ def build_buildings():
     bldg_objs = []
     block_index = 0
 
-    effective_per_block = max(4, min(BUILDINGS_PER_BLOCK, SUBDIV * SUBDIV))
+    min_per_block = max(4, min(BUILDINGS_PER_BLOCK_MIN, SUBDIV * SUBDIV))
+    max_per_block = max(min_per_block, min(BUILDINGS_PER_BLOCK_MAX, SUBDIV * SUBDIV))
+    generated_count = 0
 
     for bi in range(N):
         for bj in range(N):
@@ -595,8 +620,10 @@ def build_buildings():
             corner_cells = [(0, 0), (0, SUBDIV - 1), (SUBDIV - 1, 0), (SUBDIV - 1, SUBDIV - 1)]
             interior = [p for p in cells if p not in corner_cells]
             random.shuffle(interior)
-            regular_target = max(0, effective_per_block - len(corner_cells))
+            target_per_block = random.randint(min_per_block, max_per_block)
+            regular_target = max(0, target_per_block - len(corner_cells))
             chosen = corner_cells + interior[:regular_target]
+            generated_count += len(chosen)
 
             prev_h = -999
             prev_m = None
@@ -646,7 +673,7 @@ def build_buildings():
                 periodic_cleanup("{} blocks".format(block_index))
 
     put(bldg_objs, "Grp_Buildings")
-    print("  Buildings generated: {}".format(N * N * effective_per_block))
+    print("  Buildings generated: {}".format(generated_count))
     print("  Entrance records: {}".format(len(_entrances)))
 
 
@@ -668,7 +695,7 @@ def place_traffic_lights():
 def place_billboards():
     bcols = ["bill_r", "bill_c", "bill_y", "bill_m", "bill_g"]
     objs = []
-    for _ in range(30):
+    for _ in range(random.randint(BILLBOARD_COUNT_MIN, BILLBOARD_COUNT_MAX)):
         col = random.randint(0, N)
         side = random.choice([-1, 1])
         cx = road_cx(col) + side * (ROAD_W * 0.5 + SW_W + 0.5)
@@ -689,7 +716,7 @@ def place_billboards():
 def place_trees(sidewalk_h):
     for bi in range(N):
         for bj in range(N):
-            n_trees = random.randint(15, 20)
+            n_trees = random.randint(TREES_PER_BLOCK_MIN, TREES_PER_BLOCK_MAX)
             ox = blk_ox(bi)
             oz = blk_oz(bj)
             for _ in range(n_trees):
@@ -712,7 +739,8 @@ def place_trees(sidewalk_h):
 
 
 def place_street_furniture(sidewalk_h):
-    spacing = 14.0
+    # Reduced density vs. larger-grid version; keep all categories (lamp/bench/trash).
+    spacing = 20.0  # Increased from 14.0 to lower sidewalk prop density.
     for col in range(N + 1):
         cx = road_cx(col)
         for side in (-1, 1):
@@ -740,7 +768,7 @@ def place_street_furniture(sidewalk_h):
 
 
 def place_cars(sidewalk_h):
-    n_cars = random.randint(150, 200)
+    n_cars = random.randint(CAR_COUNT_MIN, CAR_COUNT_MAX)
     car_assets = ["car_r", "car_b", "car_s", "car_k", "car_w"]
     for _ in range(n_cars):
         lane = random.choice(["parked_v", "parked_h", "driving_v", "driving_h"])
@@ -820,7 +848,12 @@ def make_storefronts(sidewalk_h):
 def place_cranes(sidewalk_h):
     # Simplified cranes: exactly 3 cylinders + 2 boxes
     objs = []
-    positions = random.sample([(bi, bj) for bi in range(1, N - 1) for bj in range(1, N - 1)], 8)
+    interior_positions = [(bi, bj) for bi in range(1, N - 1) for bj in range(1, N - 1)]
+    # tiny/test grids may have no interior cells; allow edge blocks in that case.
+    if not interior_positions:
+        interior_positions = [(bi, bj) for bi in range(N) for bj in range(N)]
+    crane_count = min(len(interior_positions), random.randint(CRANE_COUNT_MIN, CRANE_COUNT_MAX))
+    positions = random.sample(interior_positions, crane_count)
     for bi, bj in positions:
         cx = blk_cx(bi) + random.uniform(-8, 8)
         cz = blk_cz(bj) + random.uniform(-8, 8)
@@ -892,7 +925,9 @@ def place_misc(sidewalk_h):
 def generate_city():
     print("Starting optimized procedural city generation...")
     print("  QUALITY: {}".format(QUALITY))
-    print("  Grid: {}x{} | Buildings per block: {}".format(N, N, BUILDINGS_PER_BLOCK))
+    print("  CITY_SIZE: {} | Grid: {}x{} | Buildings per block: {}-{}".format(
+        CITY_SIZE, N, N, BUILDINGS_PER_BLOCK_MIN, BUILDINGS_PER_BLOCK_MAX
+    ))
 
     # Force clean scene and suspend viewport updates for performance.
     # NOTE: This intentionally clears any unsaved scene content.
@@ -938,7 +973,7 @@ def generate_city():
         print("Master group : {}".format(MASTER))
         print("Sub-groups   : {}".format(len(_groups)))
         print("Scene children under sub-groups: {}".format(total_children))
-        print("Buildings    : {}".format(N * N * BUILDINGS_PER_BLOCK))
+        print("Buildings    : target {}-{} per block".format(BUILDINGS_PER_BLOCK_MIN, BUILDINGS_PER_BLOCK_MAX))
         print("Random seed  : 42")
         print("===========================================\n")
         completed = True
