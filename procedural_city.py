@@ -275,7 +275,7 @@ def collapse_meshes(objs, prefix):
     try:
         merged = cmds.polyUnite(valid, ch=False, mergeUVSets=True, name=uid(prefix))[0]
         return [merged]
-    except Exception:
+    except RuntimeError:
         # If Maya cannot merge a specific object set, keep the original pieces.
         return valid
 
@@ -422,7 +422,6 @@ _entrances = []   # each entry: (cx, cz, front_z, bldg_w)
 
 # Window column density: 1 column per this many units of building width
 WIN_COL_DIVISOR = 5.0
-WINDOW_BASE_Y_OFFSET = 2.5
 
 # -- Window grid helper --
 def add_windows(cx, base_y, cz, w, h, d, style):
@@ -430,6 +429,7 @@ def add_windows(cx, base_y, cz, w, h, d, style):
     objs  = []
     wmat  = "glass" if style in ("modern_glass", "futuristic") else "glassd"
     WW, WH, WD = 0.75, 1.00, 0.12    # width, height, extrusion depth
+    WINDOW_BASE_Y_OFFSET = 2.5
     WCX = max(1.8, w / WIN_COL_DIVISOR)   # column spacing
     WRY = 2.2                              # row spacing
     nx  = max(1, min(4, int((w - 0.5) / WCX)))
