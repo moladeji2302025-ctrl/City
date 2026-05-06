@@ -25,8 +25,8 @@ Specification:
     - 30 billboards along major roads
     - 15-20 trees per block along sidewalks
     - Street furniture: benches, trash cans, lamp posts
-    - 150-200 cars (parked + driving, 5 paint colours)
-    - Commercial storefronts on 30 % of buildings
+    - 150-200 cars (parked + driving, 5 paint colors)
+    - Commercial storefronts on 30% of buildings
     - Misc details: manholes, fire hydrants, dumpsters, power poles
     - Principled BSDF materials; NO lights added
 
@@ -860,11 +860,13 @@ def make_billboard(cx, by, cz, ry=0):
     return objs
 
 
-# Scatter 30 billboards along road edges
+# Scatter 30 billboards along road edges.
+# The 0.5-unit clearance pushes the billboard just beyond the sidewalk edge.
+BILLBOARD_CLEARANCE = 0.5
 for _ in range(30):
     col  = random.randint(0, N)
     side = random.choice([-1, 1])
-    cx_r = road_cx(col) + side * (ROAD_W * 0.5 + SW_W + 0.5)
+    cx_r = road_cx(col) + side * (ROAD_W * 0.5 + SW_W + BILLBOARD_CLEARANCE)
     z_r  = OZ + random.uniform(0.05, 0.95) * CITY_SZ
     bb_objs.extend(make_billboard(cx_r, SWH, z_r, ry=0))
 
