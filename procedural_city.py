@@ -63,7 +63,7 @@ TREES_PER_BLOCK_MAX = 12
 # - billboards: 10-15 (was 30 in the larger 12x12 version)
 # - cars: 50-75 (was 150-200)
 # - cranes: 3-4 (was 8)
-_CITY_SCALE = float(N * N) / 25.0
+_CITY_SCALE = float(N * N) / 25.0  # 25.0 = 5x5 baseline grid area
 BILLBOARD_COUNT_MIN = max(2, int(round(10 * _CITY_SCALE)))
 BILLBOARD_COUNT_MAX = max(BILLBOARD_COUNT_MIN, int(round(15 * _CITY_SCALE)))
 CAR_COUNT_MIN = max(8, int(round(50 * _CITY_SCALE)))
@@ -740,7 +740,7 @@ def place_trees(sidewalk_h):
 
 def place_street_furniture(sidewalk_h):
     # Reduced density vs. larger-grid version; keep all categories (lamp/bench/trash).
-    spacing = 20.0
+    spacing = 20.0  # Increased from 14.0 to lower sidewalk prop density.
     for col in range(N + 1):
         cx = road_cx(col)
         for side in (-1, 1):
@@ -849,6 +849,7 @@ def place_cranes(sidewalk_h):
     # Simplified cranes: exactly 3 cylinders + 2 boxes
     objs = []
     interior_positions = [(bi, bj) for bi in range(1, N - 1) for bj in range(1, N - 1)]
+    # tiny/test grids may have no interior cells; allow edge blocks in that case.
     if not interior_positions:
         interior_positions = [(bi, bj) for bi in range(N) for bj in range(N)]
     crane_count = min(len(interior_positions), random.randint(CRANE_COUNT_MIN, CRANE_COUNT_MAX))
