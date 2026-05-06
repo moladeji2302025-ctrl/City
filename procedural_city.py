@@ -16,6 +16,10 @@ Performance optimizations implemented:
 - Periodic cmds.cleanupScene() calls
 
 Run in Maya Script Editor (Python tab).
+
+WARNING:
+This script starts by running cmds.file(newFile=True, force=True), which
+clears the current Maya scene without prompting to save.
 """
 
 import random
@@ -33,7 +37,7 @@ ROAD_W = 8
 SW_W = 2
 STREET_MOD = ROAD_W + SW_W * 2
 MODULE = BLOCK_SIZE + STREET_MOD
-N = 12  # reduced from 20 for reliability; density increased below
+N = 12  # reduced from 20 for better viewport/memory reliability; density increased below
 CITY_SZ = N * MODULE + STREET_MOD
 OX = -CITY_SZ / 2.0
 OZ = -CITY_SZ / 2.0
@@ -473,7 +477,7 @@ def build_ground_roads_sidewalks_markings():
 
 def add_building_windows(cx, base_y, cz, w, h, d, landmark=False):
     # Instanced thin windows (no full cubes)
-    # Non-landmarks use alternating back rows to preserve visual density while
+    # Non-landmarks use every-other (even-indexed) back rows to preserve visual density while
     # reducing far-side instance counts for performance.
     nx = 4 if landmark else 3
     ny = 5 if landmark else 3
@@ -895,6 +899,7 @@ def generate_city():
     cmds.file(newFile=True, force=True)
     cmds.refresh(suspend=True)
 
+    completed = False
     try:
         cmds.group(em=True, name=MASTER)
         create_materials()
@@ -936,10 +941,13 @@ def generate_city():
         print("Buildings    : {}".format(N * N * BUILDINGS_PER_BLOCK))
         print("Random seed  : 42")
         print("===========================================\n")
+        completed = True
 
     finally:
         cmds.refresh(suspend=False)
         cmds.refresh(force=True)
+        if not completed:
+            print("City generation was interrupted; viewport refresh has been restored.")
 
 
 generate_city()
